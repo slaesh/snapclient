@@ -407,6 +407,18 @@ CONFIG_MASTER_I2S_DATAOUT_PIN=22
 # end of I2S master interface
 
 #
+# TAS5805M interface configuration
+#
+CONFIG_PIN_DAC_PWDN=33
+# end of TAS5805M interface configuration
+
+#
+# TAS5805M DSP Support
+#
+CONFIG_DAC_TAS5805M_EQ_SUPPORT=y
+# end of TAS5805M DSP Support
+
+#
 # DAC-Operation-Mode
 #
 # CONFIG_DAC_BRIDGE_MODE is not set

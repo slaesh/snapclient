@@ -164,6 +164,68 @@ esp_err_t my_i2s_channel_enable(i2s_chan_handle_t handle) {
   return ESP_OK;
 }
 
+#if CONFIG_DAC_TAS5805M
+static int32_t i2s_expand_buf[256];
+
+/* Expand 16-bit signed PCM samples to 32-bit S32_LE (left-shifted by 16 bits, MSB-aligned)
+ * so the ESP32 I2S peripheral outputs true 32-bit stereo frames (BCLK = 64 * fs = 3.072 MHz),
+ * matching the Linux TAS58xx driver (SNDRV_PCM_FMTBIT_S32_LE) 1:1.
+ * Reports *bytes_loaded in 16-bit input bytes so caller frame accounting stays unchanged.
+ */
+static esp_err_t player_i2s_preload_data(i2s_chan_handle_t tx_handle, const void *src, size_t size, size_t *bytes_loaded) {
+  const int16_t *src16 = (const int16_t *)src;
+  size_t total_in_loaded = 0;
+  size_t rem_samples = size / sizeof(int16_t);
+
+  while (rem_samples > 0) {
+    size_t chunk_samples = (rem_samples > 256) ? 256 : rem_samples;
+    for (size_t i = 0; i < chunk_samples; i++) {
+      i2s_expand_buf[i] = ((int32_t)src16[i]) << 16;
+    }
+    size_t out_loaded = 0;
+    esp_err_t err = i2s_channel_preload_data(tx_handle, i2s_expand_buf, chunk_samples * sizeof(int32_t), &out_loaded);
+    size_t samples_loaded = out_loaded / sizeof(int32_t);
+    total_in_loaded += samples_loaded * sizeof(int16_t);
+    src16 += samples_loaded;
+    rem_samples -= samples_loaded;
+    if (err != ESP_OK || samples_loaded < chunk_samples) {
+      if (bytes_loaded) *bytes_loaded = total_in_loaded;
+      return err;
+    }
+  }
+  if (bytes_loaded) *bytes_loaded = total_in_loaded;
+  return ESP_OK;
+}
+
+static esp_err_t player_i2s_write(i2s_chan_handle_t tx_handle, const void *src, size_t size, size_t *bytes_written, uint32_t timeout_ms) {
+  const int16_t *src16 = (const int16_t *)src;
+  size_t total_in_written = 0;
+  size_t rem_samples = size / sizeof(int16_t);
+
+  while (rem_samples > 0) {
+    size_t chunk_samples = (rem_samples > 256) ? 256 : rem_samples;
+    for (size_t i = 0; i < chunk_samples; i++) {
+      i2s_expand_buf[i] = ((int32_t)src16[i]) << 16;
+    }
+    size_t out_written = 0;
+    esp_err_t err = i2s_channel_write(tx_handle, i2s_expand_buf, chunk_samples * sizeof(int32_t), &out_written, timeout_ms);
+    size_t samples_written = out_written / sizeof(int32_t);
+    total_in_written += samples_written * sizeof(int16_t);
+    src16 += samples_written;
+    rem_samples -= samples_written;
+    if (err != ESP_OK || samples_written < chunk_samples) {
+      if (bytes_written) *bytes_written = total_in_written;
+      return err;
+    }
+  }
+  if (bytes_written) *bytes_written = total_in_written;
+  return ESP_OK;
+}
+#else
+#define player_i2s_preload_data i2s_channel_preload_data
+#define player_i2s_write i2s_channel_write
+#endif
+
 /**
  * This is a dirty hack to ensure smooth audio output without pops/clicks.
  * It was originally developed to suppress es8388 noise between channel
@@ -194,8 +256,8 @@ static void ensure_noiseless(i2s_chan_handle_t tx) {
 
     // Write silence
     // While this is not required to stop noise, it somehow prevents pops later.
-    i2s_channel_write(tx, silence_buf, silence_size, &bytes_written,
-                      pdMS_TO_TICKS(200));
+    player_i2s_write(tx, silence_buf, silence_size, &bytes_written,
+                     pdMS_TO_TICKS(200));
 
     // Wait for DMA to flush
     vTaskDelay(pdMS_TO_TICKS(150));
@@ -231,15 +293,27 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
   }
 
 #if USE_SAMPLE_INSERTION
+#if CONFIG_DAC_TAS5805M
+  /* With 32-bit stereo frames (8 bytes/frame), ESP32 DMA descriptors max out at
+   * 4092 / 8 = 511 frames per descriptor. Use 4 * 511 = 2044 frames (~2 * 1023).
+   */
+  i2sDmaBufCnt = 4;
+  i2sDmaBufMaxLen = 511;
+#else
   i2sDmaBufCnt = 2;
   // OPUS has a minimum frame size of 120
   // with DMA buffer set to this value sync algorithm
   // works for all decoders. We set it to 100 so
   // there will be free space for sample stuffing in each round
   i2sDmaBufMaxLen = 1023;
+#endif
 #else
   int fi2s_clk;
+#if CONFIG_DAC_TAS5805M
+  const int __dmaBufMaxLen = 511;
+#else
   const int __dmaBufMaxLen = 1023;
+#endif
   int __dmaBufCnt;
   int __dmaBufLen;
 
@@ -315,12 +389,28 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
 
   i2s_std_clk_config_t i2s_clkcfg = I2S_STD_CLK_DEFAULT_CONFIG(sr);
 
-#if USE_SAMPLE_INSERTION
-  i2s_clkcfg.clk_src = I2S_CLK_SRC_DEFAULT;
-#else
+#if SOC_I2S_SUPPORTS_APLL
+  /* Always use low-jitter fractional APLL when supported (ESP32), matching Linux PLL */
   i2s_clkcfg.clk_src = I2S_CLK_SRC_APLL;
+#else
+  i2s_clkcfg.clk_src = I2S_CLK_SRC_DEFAULT;
 #endif
 
+#if CONFIG_DAC_TAS5805M
+  /* TAS58xx requires 32-bit I2S framing (SNDRV_PCM_FMTBIT_S32_LE, BCLK = 64 * fs = 3.072 MHz)
+   * matching the Linux driver. Keep mclk_multiple = 256 (256 / 64 = 4, exact integer divider).
+   */
+  i2s_std_config_t tx_std_cfg = {
+      .clk_cfg = i2s_clkcfg,
+#if CONFIG_I2S_USE_MSB_FORMAT
+      .slot_cfg = I2S_STD_MSB_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+#else
+      .slot_cfg =
+          I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO),
+#endif
+      .gpio_cfg = pin_config0,
+  };
+#else
   // Please set the mclk_multiple to I2S_MCLK_MULTIPLE_384
   // while using 24 bits data width Otherwise the sample rate
   // might be imprecise since the BCLK division is not a integer
@@ -338,12 +428,6 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
 #endif
       .gpio_cfg = pin_config0,
   };
-
-#if CONFIG_DAC_TAS5805M
-  /* TAS58xx internal DSP/PLL requires 32-bit slot width (BCLK = 64 * fs = 3.072 MHz)
-   * to avoid lower-frequency PLL tracking jitter and bass degradation.
-   */
-  tx_std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
 #endif
 
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &tx_std_cfg));
@@ -1669,7 +1753,7 @@ static void player_task(void *pvParameters) {
             size = fragment->size;
 
             ESP_ERROR_CHECK(
-                i2s_channel_preload_data(tx_chan, p_payload, size, &written));
+                player_i2s_preload_data(tx_chan, p_payload, size, &written));
 
             // check if DMA is full at first try here
             if (written != size) {
@@ -1712,9 +1796,10 @@ static void player_task(void *pvParameters) {
 
           my_gptimer_stop(gptimer);
           
-          audio_dac_enable(true);
-          
+          /* Enable I2S clock BEFORE enabling DAC so TAS58xx DSP boots with active BCLK/LRCLK */
           my_i2s_channel_enable(tx_chan);
+          
+          audio_dac_enable(true);
           
           playback_start_time_us = esp_timer_get_time();
           samples_written = i2sDmaBufCnt * i2sDmaBufMaxLen;
@@ -1808,7 +1893,7 @@ static void player_task(void *pvParameters) {
                 dir_insert_sample = 0;
               }
 #endif             
-              i2s_channel_write(tx_chan, p_payload, size, &written, portMAX_DELAY);
+              player_i2s_write(tx_chan, p_payload, size, &written, portMAX_DELAY);
               
               samples_written += (written / framesToBytes);
               size -= written;
@@ -1817,7 +1902,7 @@ static void player_task(void *pvParameters) {
 
 #if USE_SAMPLE_INSERTION
               if (dir_insert_sample < 0) {
-                if (i2s_channel_write(tx_chan, p_payload - sampleSizeInBytes, sampleSizeInBytes, &written, portMAX_DELAY) != ESP_OK) {
+                if (player_i2s_write(tx_chan, p_payload - sampleSizeInBytes, sampleSizeInBytes, &written, portMAX_DELAY) != ESP_OK) {
                   ESP_LOGE(TAG, "i2s_playback_task:  I2S write error %d", 1);
                 }
                 else {
@@ -1872,8 +1957,8 @@ static void player_task(void *pvParameters) {
               if (size >= tmpSize) {
                 i2sWriteLen = i2sDmaBufMaxLen * framesToBytes - alreadyWritten;
 
-                i2s_channel_write(tx_chan, p_payload, i2sWriteLen, &written,
-                                  portMAX_DELAY);
+                player_i2s_write(tx_chan, p_payload, i2sWriteLen, &written,
+                                 portMAX_DELAY);
 
                 alreadyWrittenTime_us =
                     1000000LL * (int64_t)(alreadyWritten / framesToBytes) /
@@ -1892,9 +1977,9 @@ static void player_task(void *pvParameters) {
 
                 if (i2sWriteLen + sampleSizeInBytes <= i2sDmaBufMaxLen) {
                   if (dir_insert_sample < 0) {
-                    if (i2s_channel_write(tx_chan, p_payload, sampleSizeInBytes,
-                                          &insertedSamplesWritten,
-                                          portMAX_DELAY) != ESP_OK) {
+                    if (player_i2s_write(tx_chan, p_payload, sampleSizeInBytes,
+                                         &insertedSamplesWritten,
+                                         portMAX_DELAY) != ESP_OK) {
                       ESP_LOGE(TAG, "i2s_playback_task:  I2S write error %d",
                                1);
                     }
@@ -1904,8 +1989,8 @@ static void player_task(void *pvParameters) {
                 }
 #endif
 
-                i2s_channel_write(tx_chan, p_payload, i2sWriteLen, &written,
-                                  portMAX_DELAY);
+                player_i2s_write(tx_chan, p_payload, i2sWriteLen, &written,
+                                 portMAX_DELAY);
 
 #if USE_SAMPLE_INSERTION
                 alreadyWritten = written + insertedSamplesWritten;
@@ -1956,8 +2041,8 @@ static void player_task(void *pvParameters) {
           memset(tmpBuf, 0, sizeof(tmpBuf));
 
           do {
-            if (i2s_channel_write(tx_chan, tmpBuf, write_size, &written,
-                                  portMAX_DELAY) != ESP_OK) {
+            if (player_i2s_write(tx_chan, tmpBuf, write_size, &written,
+                                 portMAX_DELAY) != ESP_OK) {
               ESP_LOGE(TAG, "i2s_playback_task: I2S write error %d/%d", written,
                        size);
             }

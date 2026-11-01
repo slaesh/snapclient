@@ -825,14 +825,14 @@ esp_err_t tas5805m_settings_get_json(char *json_out, size_t max_len) {
     TAS5805M_BD_FREQ bd_freq;
     if (tas5805m_get_modulation_mode(&mod_mode, &sw_freq, &bd_freq) != ESP_OK) {
         mod_mode = MOD_MODE_BD;
-        sw_freq = SW_FREQ_768K;
-        bd_freq = SW_FREQ_80K;
+        sw_freq = SW_FREQ_384K;
+        bd_freq = SW_FREQ_100K;
     }
 
     // Get analog gain
     uint8_t analog_gain;
     if (tas5805m_get_again(&analog_gain) != ESP_OK) {
-        analog_gain = 0;
+        analog_gain = 3;
     }
 
     // Get digital volume (stored in TAS5805_STATE)
