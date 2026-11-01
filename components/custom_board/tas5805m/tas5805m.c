@@ -40,10 +40,16 @@ static const char *TAG = "TAS5805M";
       tas5805m_write_byte(TAS5805M_REG_PAGE_SET, PAGE);                   \
     } while (0)
 
+static tas58xx_chip_variant_t tas5805m_chip_variant = TAS58XX_CHIP_TAS5805M;
+
+tas58xx_chip_variant_t tas5805m_get_chip_variant(void) {
+  return tas5805m_chip_variant;
+}
+
 // State of TAS5805M (internal to this module)
 static TAS5805_STATE tas5805m_state = {
   .volume = 0,
-  .state = TAS5805M_CTRL_PLAY,
+  .state = TAS5805M_CTRL_HI_Z,
   .mixer_mode = MIXER_STEREO,
   .channel_gain_l = 0,
   .channel_gain_r = 0,
@@ -250,14 +256,35 @@ esp_err_t tas5805m_read_bytes(uint8_t *reg, int regLen, uint8_t *data, int datal
   return ret;
 }
 
-// Inits the TAS5805M change Settings in Menuconfig to enable Bridge-Mode
+bool tas5805m_wait_clock_stable(void) {
+  uint8_t global1 = 0;
+  TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+
+  for (int i = 0; i < 40; i++) {
+    tas5805m_write_byte(TAS5805M_FAULT_CLEAR_REGISTER, TAS5805M_ANALOG_FAULT_CLEAR);
+    vTaskDelay(pdMS_TO_TICKS(5));
+
+    if (tas5805m_read_byte(TAS5805M_GLOBAL_FAULT1_REGISTER, &global1) != ESP_OK) {
+      return false;
+    }
+
+    if (!(global1 & (1 << 2))) {
+      ESP_LOGD(TAG, "%s: Clock stable after ~%d ms", __func__, (i + 1) * 5);
+      return true;
+    }
+  }
+
+  ESP_LOGW(TAG, "%s: Clock fault did not clear within 200ms (global1=0x%02x)", __func__, global1);
+  return false;
+}
+
+// Inits the TAS58xx (auto-detects TAS5805M vs TAS5830M via DIE_ID)
 esp_err_t tas5805m_init() {
-  ESP_LOGD(TAG, "%s: Initializing TAS5805M", __func__);
+  ESP_LOGD(TAG, "%s: Initializing TAS58xx", __func__);
   int ret = 0;
   // Init the I2C-Driver
   i2c_master_init();
-  /* Register the PDN pin as output and write 1 to enable the TAS chip */
-  /* TAS5805M.INIT() */
+  /* Register the PDN pin as output and toggle to reset/power up the TAS chip */
   gpio_config_t io_conf;
   io_conf.intr_type = GPIO_INTR_DISABLE;
   io_conf.mode = GPIO_MODE_OUTPUT;
@@ -272,13 +299,28 @@ esp_err_t tas5805m_init() {
   vTaskDelay(10 / portTICK_PERIOD_MS);
 
   ESP_LOGI(TAG, "%s: Setting to HI Z", __func__);
-
   ESP_ERROR_CHECK(tas5805m_set_state(TAS5805M_CTRL_HI_Z));
+
+  // Detect chip variant via DIE_ID (0x67)
+  uint8_t die_id = 0;
+  if (tas5805m_read_byte(TAS5805M_DIE_ID_REGISTER, &die_id) == ESP_OK) {
+    if (die_id == TAS5830M_DIE_ID) {
+      tas5805m_chip_variant = TAS58XX_CHIP_TAS5830M;
+      ESP_LOGI(TAG, "%s: Detected TAS5830M (DIE_ID=0x%02x)", __func__, die_id);
+    } else {
+      tas5805m_chip_variant = TAS58XX_CHIP_TAS5805M;
+      ESP_LOGI(TAG, "%s: Detected TAS5805M (DIE_ID=0x%02x)", __func__, die_id);
+    }
+  } else {
+    ESP_LOGW(TAG, "%s: Failed to read DIE_ID, defaulting to TAS5805M", __func__);
+    tas5805m_chip_variant = TAS58XX_CHIP_TAS5805M;
+  }
   
   // Send RESET register flag to reset all registers to default state
-	ret = tas5805m_write_byte(TAS5805M_RESET_CTRL_REGISTER, TAS5805M_RESET_CONTROL_PORT | TAS5805M_RESET_DSP);
+  ret = tas5805m_write_byte(TAS5805M_RESET_CTRL_REGISTER, TAS5805M_RESET_CONTROL_PORT | TAS5805M_RESET_DSP);
   if (ret != ESP_OK) {
     ESP_LOGW(TAG, "%s: Failed to set RESET flag: %s", __func__, esp_err_to_name(ret));
+    return ret;
   }
 
   vTaskDelay(10 / portTICK_PERIOD_MS);
@@ -287,18 +329,28 @@ esp_err_t tas5805m_init() {
     return ret;
   }
 
-  ESP_LOGI(TAG, "%s: Setting to PLAY (muted)", __func__);
+  // TI Section 7.5.3.1 requires all analog and DSP initialization to occur in Hi-Z mode.
+  // Keep the device in Hi-Z mode (0x02). Transition to PLAY is deferred until playback starts.
+  ESP_ERROR_CHECK(tas5805m_set_state(TAS5805M_CTRL_HI_Z));
 
-  ESP_ERROR_CHECK(tas5805m_set_state(TAS5805M_CTRL_MUTE | TAS5805M_CTRL_PLAY));
-  if (ret != ESP_OK) {
-    ESP_LOGW(TAG, "%s: Set DAC state failed", __func__);
-    return ret;
+  // Configure high-fidelity defaults:
+  // BD modulation, 384 kHz switching frequency, 100 kHz loop bandwidth
+  tas5805m_set_modulation_mode(MOD_MODE_BD, SW_FREQ_384K, SW_FREQ_100K);
+  // Analog gain set to 3 (-1.5 dB)
+  tas5805m_set_again(3);
+
+  // For TAS5830M, initialize Book 0x8C Page 0x0B EQ gang & bypass defaults
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5825M_REG_BOOK_5, TAS5825M_REG_BOOK_5_PAGE);
+    uint8_t gang_reg = TAS5825M_REG_EQ_GANG_ENABLE;
+    uint8_t gang_val[4] = {0x00, 0x00, 0x00, 0x01}; // Gang enabled
+    tas5805m_write_bytes(&gang_reg, 1, gang_val, 4);
+
+    uint8_t bypass_reg = TAS5825M_REG_EQ_BYPASS_ENABLE;
+    uint8_t bypass_val[4] = {0x00, 0x00, 0x00, 0x00}; // Bypass disabled (EQ active)
+    tas5805m_write_bytes(&bypass_reg, 1, bypass_val, 4);
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
   }
-
-  /* Bridge-mode configuration removed: bridge mode is now controlled at runtime
-     via the UI and persisted through settings. If you need to reintroduce
-     compile-time bridge-mode options, re-add the Kconfig choice and the
-     corresponding conditional code here. */
 
   /* Start fault monitoring task */
   BaseType_t task_ret = xTaskCreate(
@@ -460,20 +512,21 @@ esp_err_t tas5805m_get_mute(bool *enabled) {
   return ESP_OK;
 }
 
-// Control function of TAS5805M
+// Control function of TAS58xx
 esp_err_t tas5805m_ctrl(audio_hal_codec_mode_t mode,
                         audio_hal_ctrl_t ctrl_state) {
   ESP_LOGI(TAG, "%s: Control state: %d", __func__, ctrl_state);
   TAS5805M_CTRL_STATE new_state;
 
   if (ctrl_state == AUDIO_HAL_CTRL_STOP) {
-    ESP_LOGD(TAG, "%s: Setting to DEEP_SLEEP", __func__);
-    /* Clear lower 3 bits (state field) then set to DEEP_SLEEP (0x0)
-     * This ensures lower bits are reset to 0 as required by the device.
+    ESP_LOGD(TAG, "%s: Setting to HI_Z", __func__);
+    /* Clear lower 3 bits (state field) then set to HI_Z (0x02)
+     * Output tri-stated, no noise/screeching on clock stop, registers preserved.
      */
-    new_state = (TAS5805M_CTRL_STATE)((tas5805m_state.state & ~0x07) | TAS5805M_CTRL_DEEP_SLEEP);
-  } else if (ctrl_state == AUDIO_HAL_CTRL_START ) {
-    ESP_LOGD(TAG, "%s: Setting to PLAY", __func__);
+    new_state = (TAS5805M_CTRL_STATE)((tas5805m_state.state & ~0x07) | TAS5805M_CTRL_HI_Z);
+  } else if (ctrl_state == AUDIO_HAL_CTRL_START) {
+    ESP_LOGD(TAG, "%s: Waiting for I2S clock stability and setting to PLAY", __func__);
+    tas5805m_wait_clock_stable();
     /* Clear lower 3 bits (state field) and set to PLAY (0x3), preserve other flags */
     new_state = (TAS5805M_CTRL_STATE)((tas5805m_state.state & ~0x07) | TAS5805M_CTRL_PLAY);
   } else {
@@ -508,15 +561,99 @@ esp_err_t tas5805m_get_dac_mode(TAS5805M_DAC_MODE *mode)
     return ESP_OK;
 }
 
+/* Map logical TAS5805M_SW_FREQ enum to hardware bits [6:4] */
+static uint8_t tas58xx_sw_freq_to_hardware(TAS5805M_SW_FREQ freq, tas58xx_chip_variant_t variant) {
+  /* Indices: 0=768k, 1=384k, 2=480k, 3=576k */
+  static const uint8_t fsw_5805m[4] = { 0x0, 0x1, 0x3, 0x4 };
+  static const uint8_t fsw_5830m[4] = { 0x4, 0x0, 0x2, 0x3 };
+  uint8_t idx = 0;
+  switch (freq) {
+    case SW_FREQ_768K: idx = 0; break;
+    case SW_FREQ_384K: idx = 1; break;
+    case SW_FREQ_480K: idx = 2; break;
+    case SW_FREQ_576K: idx = 3; break;
+    default: idx = 1; break;
+  }
+  uint8_t field = (variant == TAS58XX_CHIP_TAS5830M) ? fsw_5830m[idx] : fsw_5805m[idx];
+  return (field & 0x07) << 4;
+}
+
+/* Map hardware bits [6:4] to logical TAS5805M_SW_FREQ enum */
+static TAS5805M_SW_FREQ tas58xx_hardware_to_sw_freq(uint8_t raw, tas58xx_chip_variant_t variant) {
+  uint8_t field = (raw >> 4) & 0x07;
+  if (variant == TAS58XX_CHIP_TAS5830M) {
+    switch (field) {
+      case 0x4: return SW_FREQ_768K;
+      case 0x0: return SW_FREQ_384K;
+      case 0x2: return SW_FREQ_480K;
+      case 0x3: return SW_FREQ_576K;
+      default:  return SW_FREQ_384K;
+    }
+  } else {
+    switch (field) {
+      case 0x0: return SW_FREQ_768K;
+      case 0x1: return SW_FREQ_384K;
+      case 0x3: return SW_FREQ_480K;
+      case 0x4: return SW_FREQ_576K;
+      default:  return SW_FREQ_384K;
+    }
+  }
+}
+
+/* Map logical TAS5805M_BD_FREQ enum to hardware bits [6:5] */
+static uint8_t tas58xx_bd_freq_to_hardware(TAS5805M_BD_FREQ bd_freq, tas58xx_chip_variant_t variant) {
+  /* Indices: 0=80k, 1=100k, 2=120k, 3=175k */
+  static const uint8_t bd_5805m[4] = { 0x0, 0x1, 0x2, 0x3 };
+  static const uint8_t bd_5830m[4] = { 0x1, 0x0, 0x2, 0x3 };
+  uint8_t idx = 0;
+  switch (bd_freq) {
+    case SW_FREQ_80K:  idx = 0; break;
+    case SW_FREQ_100K: idx = 1; break;
+    case SW_FREQ_120K: idx = 2; break;
+    case SW_FREQ_175K: idx = 3; break;
+    default: idx = 1; break;
+  }
+  uint8_t field = (variant == TAS58XX_CHIP_TAS5830M) ? bd_5830m[idx] : bd_5805m[idx];
+  return (field & 0x03) << 5;
+}
+
+/* Map hardware bits [6:5] to logical TAS5805M_BD_FREQ enum */
+static TAS5805M_BD_FREQ tas58xx_hardware_to_bd_freq(uint8_t raw, tas58xx_chip_variant_t variant) {
+  uint8_t field = (raw >> 5) & 0x03;
+  if (variant == TAS58XX_CHIP_TAS5830M) {
+    switch (field) {
+      case 0x1: return SW_FREQ_80K;
+      case 0x0: return SW_FREQ_100K;
+      case 0x2: return SW_FREQ_120K;
+      case 0x3: return SW_FREQ_175K;
+      default:  return SW_FREQ_100K;
+    }
+  } else {
+    switch (field) {
+      case 0x0: return SW_FREQ_80K;
+      case 0x1: return SW_FREQ_100K;
+      case 0x2: return SW_FREQ_120K;
+      case 0x3: return SW_FREQ_175K;
+      default:  return SW_FREQ_100K;
+    }
+  }
+}
+
 esp_err_t tas5805m_set_dac_mode(TAS5805M_DAC_MODE mode)
 {
     ESP_LOGD(TAG, "%s: Setting DAC mode to %d", __func__, mode);
+
+    bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+    if (was_playing) {
+      tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+    }
 
     // Read the current value of the register
     uint8_t current_value;
     esp_err_t err = tas5805m_read_byte(TAS5805M_DEVICE_CTRL_1_REGISTER, &current_value);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(err));
+        if (was_playing) tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
         return err;
     }
 
@@ -533,32 +670,35 @@ esp_err_t tas5805m_set_dac_mode(TAS5805M_DAC_MODE mode)
         ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(ret));
     }
 
+    if (was_playing) {
+      tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+    }
+
     return ret;
 }
 
 esp_err_t tas5805m_get_modulation_mode(TAS5805M_MOD_MODE *mode, TAS5805M_SW_FREQ *freq, TAS5805M_BD_FREQ *bd_freq)
 {
-  // Read the current value of the register
   uint8_t current_value;
   esp_err_t err = tas5805m_read_byte(TAS5805M_DEVICE_CTRL_1_REGISTER, &current_value);
   if (err != ESP_OK) {
-      ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(err));
+      ESP_LOGE(TAG, "%s: Error reading DEVICE_CTRL_1: %s", __func__, esp_err_to_name(err));
       return err;
   }
 
   // Extract bits 0-1
-  *mode = (current_value & 0b00000011);
-  // Extract bits 4-6
-  *freq = (current_value & 0b01110000);
+  *mode = (TAS5805M_MOD_MODE)(current_value & 0b00000011);
+  // Extract bits 4-6 and translate according to chip variant
+  *freq = tas58xx_hardware_to_sw_freq(current_value, tas5805m_chip_variant);
 
   // Read the BD frequency
   err = tas5805m_read_byte(TAS5805M_ANA_CTRL_REGISTER, &current_value);
   if (err != ESP_OK) {
-      ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(err));
+      ESP_LOGE(TAG, "%s: Error reading ANA_CTRL: %s", __func__, esp_err_to_name(err));
       return err;
   }
 
-  *bd_freq = (current_value & 0b01100000);
+  *bd_freq = tas58xx_hardware_to_bd_freq(current_value, tas5805m_chip_variant);
   return ESP_OK;
 }
 
@@ -566,32 +706,51 @@ esp_err_t tas5805m_set_modulation_mode(TAS5805M_MOD_MODE mode, TAS5805M_SW_FREQ 
 {
   ESP_LOGD(TAG, "%s: Setting modulation to %d, FSW: %d, Class-D bandwidth control: %d", __func__, mode, freq, bd_freq);
 
+  bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+  if (was_playing) {
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+  }
+
   // Read the current value of the register
   uint8_t current_value;
   esp_err_t err = tas5805m_read_byte(TAS5805M_DEVICE_CTRL_1_REGISTER, &current_value);
   if (err != ESP_OK) {
       ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(err));
+      if (was_playing) tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
       return err;
   }
 
   // Clear bits 0-1 and 4-6
   current_value &= ~((0x07 << 4) | (0x03 << 0));
   // Update bit 0-1 based on the mode
-  current_value |= mode & 0b00000011;  // Set bits 0-1
-  // Update bits 4-6 based on sw freq
-  current_value |= freq & 0b01110000;  // Set bits 4-6
+  current_value |= (mode & 0b00000011);
+  // Update bits 4-6 based on sw freq translated per chip variant
+  current_value |= tas58xx_sw_freq_to_hardware(freq, tas5805m_chip_variant);
   
   // Write the updated value back to the register
   int ret = tas5805m_write_byte(TAS5805M_DEVICE_CTRL_1_REGISTER, current_value);
   if (ret != ESP_OK) {
-      ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(ret));
+      ESP_LOGE(TAG, "%s: Error writing DEVICE_CTRL_1: %s", __func__, esp_err_to_name(ret));
   } 
 
-  // Set the BD frequency
-  ret = tas5805m_write_byte(TAS5805M_ANA_CTRL_REGISTER, bd_freq);
-  if (ret != ESP_OK) {
-      ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(ret));
-  } 
+  // Read-modify-write on ANA_CTRL bits 6:5 (BW_CTL) to preserve other analog bits
+  uint8_t current_ana = 0;
+  err = tas5805m_read_byte(TAS5805M_ANA_CTRL_REGISTER, &current_ana);
+  if (err == ESP_OK) {
+    current_ana &= ~(0x03 << 5);
+    current_ana |= tas58xx_bd_freq_to_hardware(bd_freq, tas5805m_chip_variant);
+    ret = tas5805m_write_byte(TAS5805M_ANA_CTRL_REGISTER, current_ana);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s: Error writing ANA_CTRL: %s", __func__, esp_err_to_name(ret));
+    }
+  } else {
+    ESP_LOGE(TAG, "%s: Error reading ANA_CTRL: %s", __func__, esp_err_to_name(err));
+    ret = err;
+  }
+
+  if (was_playing) {
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+  }
 
   return ret;
 }
@@ -693,31 +852,55 @@ esp_err_t tas5805m_set_mixer_mode(TAS5805M_MIXER_MODE mode)
 esp_err_t tas5805m_set_mixer_gain(TAS5805M_MIXER_CHANNELS channel, uint32_t gain)
 {
   ESP_LOGD(TAG, "%s: Setting mixer gain for channel %d to 0x%08x", __func__, channel, (unsigned int)gain);
+  uint8_t page;
   uint8_t reg;
 
-  switch (channel)
-  {
-  case TAS5805M_MIXER_CHANNEL_LEFT_TO_LEFT:
-    reg = TAS5805M_REG_LEFT_TO_LEFT_GAIN;
-    break;
-  case TAS5805M_MIXER_CHANNEL_RIGHT_TO_RIGHT:
-    reg = TAS5805M_REG_RIGHT_TO_RIGHT_GAIN;
-    break;
-  case TAS5805M_MIXER_CHANNEL_LEFT_TO_RIGHT:
-    reg = TAS5805M_REG_LEFT_TO_RIGHT_GAIN;
-    break;
-  case TAS5805M_MIXER_CHANNEL_RIGHT_TO_LEFT:
-    reg = TAS5805M_REG_RIGHT_TO_LEFT_GAIN;
-    break;
-  default:
-    ESP_LOGE(TAG, "%s: Invalid mixer channel %d", __func__, channel);
-    return ESP_ERR_INVALID_ARG;
-  } 
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    page = TAS5825M_REG_BOOK_5_PAGE;
+    switch (channel)
+    {
+    case TAS5805M_MIXER_CHANNEL_LEFT_TO_LEFT:
+      reg = TAS5825M_REG_LEFT_TO_LEFT_GAIN;
+      break;
+    case TAS5805M_MIXER_CHANNEL_RIGHT_TO_RIGHT:
+      reg = TAS5825M_REG_RIGHT_TO_RIGHT_GAIN;
+      break;
+    case TAS5805M_MIXER_CHANNEL_LEFT_TO_RIGHT:
+      reg = TAS5825M_REG_LEFT_TO_RIGHT_GAIN;
+      break;
+    case TAS5805M_MIXER_CHANNEL_RIGHT_TO_LEFT:
+      reg = TAS5825M_REG_RIGHT_TO_LEFT_GAIN;
+      break;
+    default:
+      ESP_LOGE(TAG, "%s: Invalid mixer channel %d", __func__, channel);
+      return ESP_ERR_INVALID_ARG;
+    }
+  } else {
+    page = TAS5805M_REG_BOOK_5_MIXER_PAGE;
+    switch (channel)
+    {
+    case TAS5805M_MIXER_CHANNEL_LEFT_TO_LEFT:
+      reg = TAS5805M_REG_LEFT_TO_LEFT_GAIN;
+      break;
+    case TAS5805M_MIXER_CHANNEL_RIGHT_TO_RIGHT:
+      reg = TAS5805M_REG_RIGHT_TO_RIGHT_GAIN;
+      break;
+    case TAS5805M_MIXER_CHANNEL_LEFT_TO_RIGHT:
+      reg = TAS5805M_REG_LEFT_TO_RIGHT_GAIN;
+      break;
+    case TAS5805M_MIXER_CHANNEL_RIGHT_TO_LEFT:
+      reg = TAS5805M_REG_RIGHT_TO_LEFT_GAIN;
+      break;
+    default:
+      ESP_LOGE(TAG, "%s: Invalid mixer channel %d", __func__, channel);
+      return ESP_ERR_INVALID_ARG;
+    }
+  }
 
-  TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_5, TAS5805M_REG_BOOK_5_MIXER_PAGE);
+  TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_5, page);
   int ret = tas5805m_write_bytes(&reg, 1, (uint8_t *)&gain, sizeof(gain));
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "Failed to write register %d: %d", TAS5805M_REG_LEFT_TO_LEFT_GAIN, ret);
+    ESP_LOGE(TAG, "Failed to write mixer register 0x%02x: %d", reg, ret);
   }
 
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO); 
@@ -739,15 +922,25 @@ esp_err_t tas5805m_set_channel_gain(TAS5805M_EQ_CHANNELS channel, int8_t gain_db
   float linear = powf(10.0f, ((float)gain_db) / 20.0f);
   uint32_t reg_value = tas5805m_float_to_q9_23(linear);
 
+  uint8_t page;
   uint8_t reg;
-  if (channel == TAS5805M_EQ_CHANNELS_RIGHT) {
-    reg = TAS5805M_REG_RIGHT_VOLUME;
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    page = TAS5825M_REG_BOOK_5_PAGE;
+    if (channel == TAS5805M_EQ_CHANNELS_RIGHT) {
+      reg = TAS5825M_REG_RIGHT_VOLUME;
+    } else {
+      reg = TAS5825M_REG_LEFT_VOLUME;
+    }
   } else {
-    // Default to left for any other value (matches other EQ channel helpers)
-    reg = TAS5805M_REG_LEFT_VOLUME;
+    page = TAS5805M_REG_BOOK_5_VOLUME_PAGE;
+    if (channel == TAS5805M_EQ_CHANNELS_RIGHT) {
+      reg = TAS5805M_REG_RIGHT_VOLUME;
+    } else {
+      reg = TAS5805M_REG_LEFT_VOLUME;
+    }
   }
 
-  TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_5, TAS5805M_REG_BOOK_5_VOLUME_PAGE);
+  TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_5, page);
   int ret = tas5805m_write_bytes(&reg, 1, (uint8_t *)&reg_value, sizeof(reg_value));
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "%s: Failed to write volume register 0x%02x: %s", __func__, reg, esp_err_to_name(ret));
@@ -878,29 +1071,62 @@ void tas5805m_decode_faults(TAS5805M_FAULT fault)
 
 esp_err_t tas5805m_get_eq_mode(TAS5805M_EQ_MODE *mode)
 {
-  uint8_t value = 0;
-  esp_err_t err = tas5805m_read_byte(TAS5805M_DSP_MISC_REGISTER, &value);
-  if (err != ESP_OK)
-  {
-    ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(err));
-    return err;
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5825M_REG_BOOK_5, TAS5825M_REG_BOOK_5_PAGE);
+    uint8_t bypass_reg = TAS5825M_REG_EQ_BYPASS_ENABLE;
+    uint8_t bypass_val[4] = {0};
+    esp_err_t err = tas5805m_read_bytes(&bypass_reg, 1, bypass_val, 4);
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    if (err != ESP_OK) {
+      ESP_LOGE(TAG, "%s: Error reading EQ bypass register: %s", __func__, esp_err_to_name(err));
+      return err;
+    }
+    // bypass_val[3] == 0 means EQ is enabled (not bypassed)
+    *mode = (bypass_val[3] == 0) ? TAS5805M_EQ_MODE_ON : TAS5805M_EQ_MODE_OFF;
+    return ESP_OK;
+  } else {
+    uint8_t value = 0;
+    esp_err_t err = tas5805m_read_byte(TAS5805M_DSP_MISC_REGISTER, &value);
+    if (err != ESP_OK)
+    {
+      ESP_LOGE(TAG, "%s: Error during I2C transmission: %s", __func__, esp_err_to_name(err));
+      return err;
+    }
+
+    // Extract the EQ mode from the value
+    *mode = (TAS5805M_EQ_MODE)(value & 0b00001111);
+    return ESP_OK;
   }
-
-  // Extract the EQ mode from the value
-  *mode = (TAS5805M_EQ_MODE)(value & 0b00001111);
-  return ESP_OK;
-}
-
-esp_err_t tas5805m_set_eq_mode(TAS5805M_EQ_MODE mode)
-{
-  ESP_LOGD(TAG, "%s: Setting EQ MODE to %d", __func__, mode);
-  return tas5805m_write_byte(TAS5805M_DSP_MISC_REGISTER, (uint8_t)mode);
 }
 
 esp_err_t tas5805m_set_eq(bool enable)
 {
   ESP_LOGD(TAG, "%s: Setting EQ to %d", __func__, enable);
-  return tas5805m_write_byte(TAS5805M_DSP_MISC_REGISTER, enable ? TAS5805M_CTRL_EQ_ON : TAS5805M_CTRL_EQ_OFF);
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5825M_REG_BOOK_5, TAS5825M_REG_BOOK_5_PAGE);
+    uint8_t gang_reg = TAS5825M_REG_EQ_GANG_ENABLE;
+    uint8_t gang_val[4] = {0x00, 0x00, 0x00, 0x01};
+    tas5805m_write_bytes(&gang_reg, 1, gang_val, 4);
+
+    uint8_t bypass_reg = TAS5825M_REG_EQ_BYPASS_ENABLE;
+    uint8_t bypass_val[4] = {0x00, 0x00, 0x00, enable ? 0x00 : 0x01};
+    int ret = tas5805m_write_bytes(&bypass_reg, 1, bypass_val, 4);
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    return ret;
+  } else {
+    return tas5805m_write_byte(TAS5805M_DSP_MISC_REGISTER, enable ? TAS5805M_CTRL_EQ_ON : TAS5805M_CTRL_EQ_OFF);
+  }
+}
+
+esp_err_t tas5805m_set_eq_mode(TAS5805M_EQ_MODE mode)
+{
+  ESP_LOGD(TAG, "%s: Setting EQ MODE to %d", __func__, mode);
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    bool enable = (mode != TAS5805M_EQ_MODE_OFF && mode != TAS5805M_EQ_MODE_BIAMP_OFF);
+    return tas5805m_set_eq(enable);
+  } else {
+    return tas5805m_write_byte(TAS5805M_DSP_MISC_REGISTER, (uint8_t)mode);
+  }
 }
 
 esp_err_t tas5805m_get_eq_gain(int band, int *gain)
@@ -947,7 +1173,17 @@ esp_err_t tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS channel, int band, i
   int x = gain + TAS5805M_EQ_MAX_DB;                                 
   int y = band * TAS5805M_EQ_KOEF_PER_BAND * TAS5805M_EQ_REG_PER_KOEF; 
     
-  const reg_sequence_eq **eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? tas5805m_eq_registers_right : tas5805m_eq_registers_left;
+  bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+  if (was_playing) {
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+  }
+
+  const reg_sequence_eq **eq_maps;
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    eq_maps = tas5825m_eq_registers;
+  } else {
+    eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? tas5805m_eq_registers_right : tas5805m_eq_registers_left;
+  }
 
   for (int i = 0; i < TAS5805M_EQ_KOEF_PER_BAND * TAS5805M_EQ_REG_PER_KOEF; i += TAS5805M_EQ_REG_PER_KOEF) 
   { 
@@ -988,6 +1224,11 @@ esp_err_t tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS channel, int band, i
     tas5805m_state.eq_gain_l[band] = gain;
                                                                       
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO); 
+
+  if (was_playing) {
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+  }
+
   return ret;
 }
 
@@ -1013,7 +1254,17 @@ esp_err_t tas5805m_set_eq_profile_channel(TAS5805M_EQ_CHANNELS channel, TAS5805M
   int ret = ESP_OK;
   ESP_LOGD(TAG, "%s: Setting EQ profile to %d", __func__, profile);
   
-  const reg_sequence_eq **eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? tas5805m_eq_profile_right_registers : tas5805m_eq_profile_left_registers;
+  bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+  if (was_playing) {
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+  }
+
+  const reg_sequence_eq **eq_maps;
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    eq_maps = tas5825m_eq_profile_registers;
+  } else {
+    eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? tas5805m_eq_profile_right_registers : tas5805m_eq_profile_left_registers;
+  }
 
   int x = (uint8_t)profile;
   for (int i = 0; i < TAS5805M_EQ_PROFILE_REG_PER_STEP; i += TAS5805M_EQ_REG_PER_KOEF) 
@@ -1054,6 +1305,11 @@ esp_err_t tas5805m_set_eq_profile_channel(TAS5805M_EQ_CHANNELS channel, TAS5805M
   tas5805m_state.eq_profile[channel] = profile;
 
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO); 
+
+  if (was_playing) {
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+  }
+
   return ret;
 }
 
@@ -1090,8 +1346,13 @@ static esp_err_t tas5805m_get_biquad_register(TAS5805M_EQ_CHANNELS channel, int 
   // Calculate position in the register map
   // We need to look at the data tables to find the pattern
   // From tas5805m_set_eq_gain_channel: gain 0dB is at index TAS5805M_EQ_MAX_DB
-  const reg_sequence_eq **eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? 
-                                     tas5805m_eq_registers_right : tas5805m_eq_registers_left;
+  const reg_sequence_eq **eq_maps;
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    eq_maps = tas5825m_eq_registers;
+  } else {
+    eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? 
+               tas5805m_eq_registers_right : tas5805m_eq_registers_left;
+  }
   
   // Use 0dB gain (middle of the range) as reference for current coefficient positions
   int gain_index = TAS5805M_EQ_MAX_DB; // 0dB
@@ -1157,6 +1418,11 @@ esp_err_t tas5805m_write_biquad_coefficients(TAS5805M_EQ_CHANNELS channel, int b
   ESP_LOGD(TAG, "%s: B0=%f, B1=%f, B2=%f, A1=%f, A2=%f", 
            __func__, b0, b1, b2, a1, a2);
 
+  bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+  if (was_playing) {
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+  }
+
   esp_err_t ret = ESP_OK;
   uint8_t current_page = 0;
   uint8_t page, offset;
@@ -1168,6 +1434,7 @@ esp_err_t tas5805m_write_biquad_coefficients(TAS5805M_EQ_CHANNELS channel, int b
   for (int i = 0; i < TAS5805M_EQ_KOEF_PER_BAND; i++) {
     ret = tas5805m_get_biquad_register(channel, band, i, &page, &offset);
     if (ret != ESP_OK) {
+      if (was_playing) tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
       return ret;
     }
     
@@ -1189,6 +1456,11 @@ esp_err_t tas5805m_write_biquad_coefficients(TAS5805M_EQ_CHANNELS channel, int b
   }
   
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+
+  if (was_playing) {
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+  }
+
   return ret;
 }
 

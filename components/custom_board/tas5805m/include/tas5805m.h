@@ -36,6 +36,8 @@
 #if defined(CONFIG_DAC_TAS5805M_EQ_SUPPORT)
 #include "tas5805m_eq.h"
 #include "tas5805m_eq_profiles.h"
+#include "tas5825m_eq.h"
+#include "tas5825m_eq_profiles.h"
 #endif
 
 #ifdef __cplusplus
@@ -71,6 +73,20 @@ typedef struct {
  *     - ESP_FAIL
  */
 esp_err_t tas5805m_init();
+
+/**
+ * @brief Get the detected TAS58xx chip variant
+ *
+ * @return tas58xx_chip_variant_t (TAS58XX_CHIP_TAS5805M or TAS58XX_CHIP_TAS5830M)
+ */
+tas58xx_chip_variant_t tas5805m_get_chip_variant(void);
+
+/**
+ * @brief Wait for the I2S clock to become stable and clock faults to clear
+ *
+ * @return true if clock locked and stable, false if timeout
+ */
+bool tas5805m_wait_clock_stable(void);
 
 /**
  * @brief Deinitialize TAS5805 codec chip

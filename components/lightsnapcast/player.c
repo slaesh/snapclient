@@ -339,6 +339,13 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
       .gpio_cfg = pin_config0,
   };
 
+#if CONFIG_DAC_TAS5805M
+  /* TAS58xx internal DSP/PLL requires 32-bit slot width (BCLK = 64 * fs = 3.072 MHz)
+   * to avoid lower-frequency PLL tracking jitter and bass degradation.
+   */
+  tx_std_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
+#endif
+
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &tx_std_cfg));
   // This prevents pops/clicks on some I2S codecs
   ensure_noiseless(tx_chan);

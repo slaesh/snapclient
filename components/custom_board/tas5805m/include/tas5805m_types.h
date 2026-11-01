@@ -16,6 +16,12 @@ extern "C" {
 #define TAS5805M_VOLUME_DIGITAL_DEFAULT 48 //  +0 Db
 #define TAS5805M_VOLUME_DIGITAL_MIN 0	   // +24 Db
 
+/* Chip Variant */
+typedef enum {
+	TAS58XX_CHIP_TAS5805M = 0,
+	TAS58XX_CHIP_TAS5830M = 1,
+} tas58xx_chip_variant_t;
+
 /* Control states */
 typedef enum {
 	TAS5805M_CTRL_DEEP_SLEEP = 0x00,
