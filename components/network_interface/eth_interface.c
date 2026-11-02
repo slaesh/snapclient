@@ -81,26 +81,18 @@ static esp_eth_handle_t eth_init_internal(esp_eth_mac_t **mac_out,
   eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
 
   // Update PHY config based on board specific configuration
-  phy_config.phy_addr = CONFIG_SNAPCLIENT_ETH_PHY_ADDR;
-  phy_config.reset_gpio_num = CONFIG_SNAPCLIENT_ETH_PHY_RST_GPIO;
+  phy_config.phy_addr = 0;
+  phy_config.reset_gpio_num = 5;
 
   // Init vendor specific MAC config to default
   eth_esp32_emac_config_t esp32_emac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
   // Update vendor specific MAC config based on board configuration
-  esp32_emac_config.smi_mdc_gpio_num = CONFIG_SNAPCLIENT_ETH_MDC_GPIO;
-  esp32_emac_config.smi_mdio_gpio_num = CONFIG_SNAPCLIENT_ETH_MDIO_GPIO;
+  esp32_emac_config.smi_mdc_gpio_num = 23;
+  esp32_emac_config.smi_mdio_gpio_num = 18;
 
   // Set clock mode and GPIO
-#if CONFIG_ETH_RMII_CLK_INPUT
-  esp32_emac_config.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
-  esp32_emac_config.clock_config.rmii.clock_gpio = CONFIG_ETH_RMII_CLK_IN_GPIO;
-#elif CONFIG_ETH_RMII_CLK_OUTPUT
   esp32_emac_config.clock_config.rmii.clock_mode = EMAC_CLK_OUT;
-  esp32_emac_config.clock_config.rmii.clock_gpio = CONFIG_ETH_RMII_CLK_OUT_GPIO;
-#else
-  esp32_emac_config.clock_config.rmii.clock_mode = EMAC_CLK_DEFAULT;
-  esp32_emac_config.clock_config.rmii.clock_gpio = EMAC_CLK_OUT_GPIO;
-#endif
+  esp32_emac_config.clock_config.rmii.clock_gpio = 0;
 
   // Create new ESP32 Ethernet MAC instance
   esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_emac_config, &mac_config);

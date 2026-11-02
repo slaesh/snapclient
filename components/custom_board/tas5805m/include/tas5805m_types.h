@@ -69,6 +69,7 @@ typedef enum {
 	MIXER_MONO,
 	MIXER_RIGHT,
 	MIXER_LEFT,
+	MIXER_MAX,
 } TAS5805M_MIXER_MODE;
 
 typedef enum {

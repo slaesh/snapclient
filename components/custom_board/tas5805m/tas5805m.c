@@ -65,7 +65,7 @@ typedef struct {
   TAS5805M_SW_FREQ sw_freq;
   TAS5805M_BD_FREQ bd_freq;
   TAS5805M_EQ_MODE eq_mode;
-  bool eq_using_profile[2];
+  bool use_eq_profile[2];
 } tas5805m_hw_cache_t;
 
 static tas5805m_hw_cache_t tas5805m_hw = {
@@ -78,7 +78,7 @@ static tas5805m_hw_cache_t tas5805m_hw = {
   .sw_freq = SW_FREQ_384K,
   .bd_freq = SW_FREQ_100K,
   .eq_mode = TAS5805M_EQ_MODE_OFF,
-  .eq_using_profile = {false, false},
+  .use_eq_profile = {false, false},
 };
 
 typedef struct {
