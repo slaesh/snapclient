@@ -468,26 +468,29 @@ esp_err_t tas5805m_set_state(TAS5805M_CTRL_STATE state)
 
 // Setting the Volume (0..100%) using cubic perceptual loudness curve matching Linux snapclient
 esp_err_t tas5805m_set_volume(int vol) {
-  ESP_LOGD(TAG, "%s: Setting volume to %d%%", __func__, vol);
   /* Clamp input percent to [0..100] */
   if (vol < 0) vol = 0;
   if (vol > 100) vol = 100;
 
   uint8_t reg_val = 0;
+  float db = 0.0f;
   if (vol == 0) {
     reg_val = (uint8_t)TAS5805M_VOLUME_MUTE;
+    ESP_LOGI(TAG, "Volume set: %d%% -> MUTE (reg 0x%02X)", vol, reg_val);
   } else {
     /* Linux snapclient uses a cubic volume curve: linear_gain = (vol / 100.0)^3
      * In dB: dB = 20 * log10((vol / 100.0)^3) = 60 * log10(vol / 100.0).
      * TAS58xx VOL_CTRL (0x4C): 0x30 = 0.0 dB, +1 step = -0.5 dB (2 steps per dB).
      * Previously, linear mapping in dB made 50% = -30 dB (12 dB quieter than Linux's -18 dB!)
      */
-    float db = 60.0f * log10f((float)vol / 100.0f);
+    db = 60.0f * log10f((float)vol / 100.0f);
     int steps_from_0db = (int)lroundf(-db * 2.0f);
     int computed = (int)TAS5805M_VOLUME_MAX + steps_from_0db;
     if (computed < (int)TAS5805M_VOLUME_MAX) computed = (int)TAS5805M_VOLUME_MAX;
     if (computed > 0xFE) computed = 0xFE;
     reg_val = (uint8_t)computed;
+    float actual_db = (float)((int)TAS5805M_VOLUME_MAX - (int)reg_val) * 0.5f;
+    ESP_LOGI(TAG, "Volume set: %d%% -> reg 0x%02X (%.1f dB, target %.1f dB)", vol, reg_val, actual_db, db);
   }
 
   tas5805m_hw.raw_vol = reg_val;
