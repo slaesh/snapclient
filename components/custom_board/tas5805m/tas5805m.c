@@ -1143,7 +1143,21 @@ esp_err_t tas5805m_set_mixer_mode(TAS5805M_MIXER_MODE mode)
   if (!tas5805m_hw.is_powered) {
     return ESP_OK;
   }
-  return tas5805m_apply_mixer_mode_hw(mode);
+
+  bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+  if (was_playing) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+  }
+
+  esp_err_t ret = tas5805m_apply_mixer_mode_hw(mode);
+
+  if (was_playing) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+  }
+
+  return ret;
 }
 
 esp_err_t tas5805m_set_mixer_gain(TAS5805M_MIXER_CHANNELS channel, uint32_t gain)
@@ -1260,7 +1274,20 @@ esp_err_t tas5805m_set_channel_gain(TAS5805M_EQ_CHANNELS channel, int8_t gain_db
     return ESP_OK;
   }
 
-  return tas5805m_apply_channel_gain_hw(channel, gain_db);
+  bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+  if (was_playing) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+  }
+
+  esp_err_t ret = tas5805m_apply_channel_gain_hw(channel, gain_db);
+
+  if (was_playing) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+  }
+
+  return ret;
 }
 
 esp_err_t tas5805m_get_channel_gain(TAS5805M_EQ_CHANNELS channel, int8_t *gain_db)
@@ -1422,6 +1449,13 @@ esp_err_t tas5805m_set_eq(bool enable)
     return ESP_OK;
   }
 
+  bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+  if (was_playing) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+  }
+
+  esp_err_t ret = ESP_OK;
   if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
     TAS5805M_SET_BOOK_AND_PAGE(TAS5825M_REG_BOOK_5, TAS5825M_REG_BOOK_5_PAGE);
     uint8_t gang_reg = TAS5825M_REG_EQ_GANG_ENABLE;
@@ -1430,13 +1464,19 @@ esp_err_t tas5805m_set_eq(bool enable)
 
     uint8_t bypass_reg = TAS5825M_REG_EQ_BYPASS_ENABLE;
     uint8_t bypass_val[4] = {0x00, 0x00, 0x00, enable ? 0x00 : 0x01};
-    int ret = tas5805m_write_bytes(&bypass_reg, 1, bypass_val, 4);
+    ret = tas5805m_write_bytes(&bypass_reg, 1, bypass_val, 4);
     TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
-    return ret;
   } else {
     TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
-    return tas5805m_write_byte(TAS5805M_DSP_MISC_REGISTER, enable ? TAS5805M_CTRL_EQ_ON : TAS5805M_CTRL_EQ_OFF);
+    ret = tas5805m_write_byte(TAS5805M_DSP_MISC_REGISTER, enable ? TAS5805M_CTRL_EQ_ON : TAS5805M_CTRL_EQ_OFF);
   }
+
+  if (was_playing) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+  }
+
+  return ret;
 }
 
 esp_err_t tas5805m_set_eq_mode(TAS5805M_EQ_MODE mode)
