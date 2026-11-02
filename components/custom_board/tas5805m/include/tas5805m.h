@@ -352,6 +352,16 @@ esp_err_t tas5805m_clear_faults();
  */
 void tas5805m_decode_faults(TAS5805M_FAULT fault);
 
+/**
+ * @brief Dump current I2C hardware registers to text buffer and ESP_LOGI
+ *
+ * @param buf: Pointer to destination character buffer (optional)
+ * @param buf_len: Capacity of destination buffer
+ *
+ * @return ESP_OK on success
+ */
+esp_err_t tas5805m_dump_registers(char *buf, size_t buf_len);
+
 #if defined(CONFIG_DAC_TAS5805M_EQ_SUPPORT)
 
 /**

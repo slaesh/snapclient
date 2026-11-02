@@ -673,6 +673,44 @@ static esp_err_t get_dac_settings_handler(httpd_req_t *req) {
 }
 
 /*
+ * GET /api/dac/registers handler
+ * Dumps hardware I2C registers as formatted plain text
+ */
+static esp_err_t get_dac_registers_handler(httpd_req_t *req) {
+  ESP_LOGI(TAG, "%s: uri=%s", __func__, req->uri);
+  set_cors_headers(req);
+
+#if CONFIG_DAC_TAS5805M
+  char *dump_buf = (char *)malloc(3072);
+  if (!dump_buf) {
+    ESP_LOGE(TAG, "%s: Failed to allocate memory for register dump", __func__);
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "Memory allocation failed");
+    return ESP_OK;
+  }
+
+  esp_err_t ret = tas5805m_settings_dump_registers(dump_buf, 3072);
+  if (ret != ESP_OK) {
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_set_type(req, "text/plain");
+    httpd_resp_sendstr(req, dump_buf[0] ? dump_buf : "Failed to dump registers (DAC not powered or I2C error)");
+    free(dump_buf);
+    return ESP_OK;
+  }
+
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "text/plain");
+  httpd_resp_sendstr(req, dump_buf);
+  free(dump_buf);
+  return ESP_OK;
+#else
+  httpd_resp_set_status(req, "404 Not Found");
+  httpd_resp_sendstr(req, "TAS5805M not configured");
+  return ESP_OK;
+#endif
+}
+
+/*
  * GET /api/dac/schema handler
  * Returns TAS5805M DAC settings schema as JSON
  */
@@ -1138,6 +1176,21 @@ esp_err_t start_server(const char *base_path, int port) {
 		.handler = options_handler,
 	};
 	httpd_register_uri_handler(server, &_options_dac_schema_handler);
+
+	/* URI handler for I2C register dump */
+	httpd_uri_t _get_dac_registers_handler = {
+		.uri = "/api/dac/registers",
+		.method = HTTP_GET,
+		.handler = get_dac_registers_handler,
+	};
+	httpd_register_uri_handler(server, &_get_dac_registers_handler);
+
+	httpd_uri_t _options_dac_registers_handler = {
+		.uri = "/api/dac/registers",
+		.method = HTTP_OPTIONS,
+		.handler = options_handler,
+	};
+	httpd_register_uri_handler(server, &_options_dac_registers_handler);
 
 	/* URI handlers for EQ settings API */
 	httpd_uri_t _get_eq_settings_handler = {

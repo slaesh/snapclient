@@ -432,6 +432,16 @@
     <div class="loading">Loading DAC settings...</div>
   </div>
 
+  <div style="margin-top: 25px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+    <h3 style="margin-top:0; color:#333;">Hardware I2C Register Diagnostics</h3>
+    <p style="font-size:14px; color:#666; margin-bottom:15px;">Reads and displays live hardware registers (Control, State, Volume, Mixer Matrix, Faults) directly from the amplifier via I2C, and outputs them to the serial monitor.</p>
+    <div style="display:flex; gap:10px; align-items:center;">
+      <button id="dump-regs-btn" onclick="dumpRegisters()" style="padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold;">Dump I2C Registers</button>
+      <button id="copy-regs-btn" onclick="copyRegisterDump()" style="padding: 10px 15px; background: #6c757d; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; display: none;">Copy to Clipboard</button>
+    </div>
+    <pre id="regs-dump-output" style="margin-top: 15px; background: #1e1e1e; color: #4af626; padding: 15px; border-radius: 6px; font-family: monospace; font-size: 13px; line-height: 1.5; max-height: 500px; overflow-y: auto; display: none; white-space: pre-wrap;"></pre>
+  </div>
+
   <script>
     'use strict';
 
@@ -832,6 +842,36 @@
         console.error('Error updating DAC setting:', error);
         alert('Failed to update DAC setting. Please try again.');
       }
+    }
+
+    // Register diagnostics dump
+    async function dumpRegisters() {
+      const btn = document.getElementById('dump-regs-btn');
+      const copyBtn = document.getElementById('copy-regs-btn');
+      const out = document.getElementById('regs-dump-output');
+      btn.disabled = true;
+      btn.textContent = 'Reading I2C registers...';
+      try {
+        const response = await getRequest('/api/dac/registers');
+        const text = await response.text();
+        out.style.display = 'block';
+        out.textContent = text;
+        copyBtn.style.display = 'inline-block';
+      } catch (err) {
+        alert('Failed to dump registers: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Dump I2C Registers';
+      }
+    }
+
+    function copyRegisterDump() {
+      const text = document.getElementById('regs-dump-output').textContent;
+      navigator.clipboard.writeText(text).then(() => {
+        const copyBtn = document.getElementById('copy-regs-btn');
+        copyBtn.textContent = 'Copied!';
+        setTimeout(() => copyBtn.textContent = 'Copy to Clipboard', 2000);
+      });
     }
 
     // Initialize on page load

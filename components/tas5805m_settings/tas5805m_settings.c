@@ -3266,4 +3266,8 @@ esp_err_t tas5805m_settings_set_eq_from_json(const char *json_in) {
     return ESP_OK;
 }
 
+esp_err_t tas5805m_settings_dump_registers(char *buf, size_t buf_len) {
+    return tas5805m_dump_registers(buf, buf_len);
+}
+
 #endif /* CONFIG_DAC_TAS5805M */

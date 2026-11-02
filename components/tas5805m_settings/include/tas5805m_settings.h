@@ -151,6 +151,9 @@ esp_err_t tas5805m_settings_get_eq_schema_json(char *json_out, size_t max_len);
 /** Update TAS5805M EQ settings from JSON */
 esp_err_t tas5805m_settings_set_eq_from_json(const char *json_in);
 
+/** Dump current TAS58xx I2C registers */
+esp_err_t tas5805m_settings_dump_registers(char *buf, size_t buf_len);
+
 /** Apply all persisted TAS5805M settings from NVS to the hardware. */
 /** Apply settings that are safe to write immediately (before audio playback).
  *  Examples: DAC mode, analog gain, modulation mode, mixer mode.

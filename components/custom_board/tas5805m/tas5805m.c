@@ -1913,3 +1913,120 @@ uint32_t tas5805m_swap_endian_32(uint32_t val)
            ((val & 0xFF0000) >> 8) |
            ((val >> 24) & 0xFF);
 }
+
+esp_err_t tas5805m_dump_registers(char *buf, size_t buf_len)
+{
+  size_t off = 0;
+  #define DUMP_PRINT(...) do { \
+    if (buf && off < buf_len) { \
+      off += snprintf(buf + off, buf_len - off, __VA_ARGS__); \
+    } \
+  } while(0)
+
+  TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+
+  uint8_t die_id = 0, die_ver = 0, ctrl1 = 0, ctrl2 = 0;
+  uint8_t vol = 0, again = 0, ana_ctrl = 0, dac_ctrl = 0;
+  uint8_t sap1 = 0, sap2 = 0, sap3 = 0;
+  uint8_t f_chan = 0, f_glob1 = 0, f_glob2 = 0, f_warn = 0;
+
+  tas5805m_read_byte(TAS5805M_DIE_ID_REGISTER, &die_id);
+  tas5805m_read_byte(0x68, &die_ver);
+  tas5805m_read_byte(TAS5805M_DEVICE_CTRL_1_REGISTER, &ctrl1);
+  tas5805m_read_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, &ctrl2);
+  tas5805m_read_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, &vol);
+  tas5805m_read_byte(TAS5805M_AGAIN_REGISTER, &again);
+  tas5805m_read_byte(TAS5805M_ANA_CTRL_REGISTER, &ana_ctrl);
+  tas5805m_read_byte(0x5E, &dac_ctrl);
+  tas5805m_read_byte(0x24, &sap1);
+  tas5805m_read_byte(0x25, &sap2);
+  tas5805m_read_byte(0x26, &sap3);
+  tas5805m_read_byte(TAS5805M_CHAN_FAULT_REGISTER, &f_chan);
+  tas5805m_read_byte(TAS5805M_GLOBAL_FAULT1_REGISTER, &f_glob1);
+  tas5805m_read_byte(TAS5805M_GLOBAL_FAULT2_REGISTER, &f_glob2);
+  tas5805m_read_byte(TAS5805M_OT_WARNING_REGISTER, &f_warn);
+
+  const char *chip_name = (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) ? "TAS5830M" : "TAS5805M";
+  bool pbtl = (ctrl1 & (1 << 2)) != 0;
+  uint8_t fsw = (ctrl1 >> 4) & 0x07;
+  uint8_t mod = ctrl1 & 0x03;
+
+  DUMP_PRINT("=== TAS58xx Hardware Register Dump ===\n");
+  DUMP_PRINT("Chip Detected:    %s (DIE_ID=0x%02X, REV=0x%02X)\n", chip_name, die_id, die_ver);
+  DUMP_PRINT("I2C Address:      0x%02X\n", TAS5805M_ADDRESS);
+  DUMP_PRINT("DAC Powered:      %s\n\n", tas5805m_hw.is_powered ? "YES" : "NO");
+
+  DUMP_PRINT("[Book 0x00 Page 0x00 - Control Registers]\n");
+  DUMP_PRINT("  0x02 DEVICE_CTRL_1: 0x%02X  [PBTL=%d (%s), FSW=%d, MOD=%d]\n", 
+             ctrl1, pbtl, pbtl ? "PBTL Mono (PARALLEL)" : "BTL Stereo", fsw, mod);
+  DUMP_PRINT("  0x03 DEVICE_CTRL_2: 0x%02X  [State: %s (0x%02X)]\n", ctrl2, 
+             ctrl2 == 0x03 ? "PLAY" : ctrl2 == 0x02 ? "Hi-Z" : ctrl2 == 0x0B ? "PLAY+MUTE" : ctrl2 == 0x01 ? "SLEEP" : "DEEP_SLEEP", ctrl2);
+  DUMP_PRINT("  0x24 SAP_CTRL_1:    0x%02X\n", sap1);
+  DUMP_PRINT("  0x25 SAP_CTRL_2:    0x%02X\n", sap2);
+  DUMP_PRINT("  0x26 SAP_CTRL_3:    0x%02X\n", sap3);
+  DUMP_PRINT("  0x4C DIG_VOL_CTRL:  0x%02X  (%.1f dB)\n", vol, (vol <= 0x30) ? (0x30 - vol) * 0.5f : -(vol - 0x30) * 0.5f);
+  DUMP_PRINT("  0x54 AGAIN:         0x%02X  (Index %d = %.1f dB)\n", again, tas5805m_hw.again, -0.5f * tas5805m_hw.again);
+  DUMP_PRINT("  0x5E DAC_CTRL:      0x%02X\n", dac_ctrl);
+  DUMP_PRINT("  0x5F ANA_CTRL:      0x%02X\n", ana_ctrl);
+  DUMP_PRINT("  0x70 CHAN_FAULT:    0x%02X  [L-OC:%d R-OC:%d L-DC:%d R-DC:%d]\n",
+             f_chan, (f_chan>>1)&1, f_chan&1, (f_chan>>3)&1, (f_chan>>2)&1);
+  DUMP_PRINT("  0x71 GLOBAL_FAULT1: 0x%02X  [CLK_FLT:%d PVDD_UV:%d]\n",
+             f_glob1, (f_glob1>>2)&1, (f_glob1>>0)&1);
+  DUMP_PRINT("  0x72 GLOBAL_FAULT2: 0x%02X\n", f_glob2);
+  DUMP_PRINT("  0x73 OT_WARNING:    0x%02X\n\n", f_warn);
+
+  /* Read DSP Registers from Book 0x8C */
+  uint8_t vol_l[4] = {0}, vol_r[4] = {0};
+  uint8_t m_l2l[4] = {0}, m_r2l[4] = {0}, m_l2r[4] = {0}, m_r2r[4] = {0};
+  uint8_t eq_gang[4] = {0}, eq_byp[4] = {0};
+
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    TAS5805M_SET_BOOK_AND_PAGE(TAS5825M_REG_BOOK_5, TAS5825M_REG_BOOK_5_PAGE);
+    uint8_t r;
+    r = TAS5825M_REG_LEFT_VOLUME;        tas5805m_read_bytes(&r, 1, vol_l, 4);
+    r = TAS5825M_REG_RIGHT_VOLUME;       tas5805m_read_bytes(&r, 1, vol_r, 4);
+    r = TAS5825M_REG_LEFT_TO_LEFT_GAIN;  tas5805m_read_bytes(&r, 1, m_l2l, 4);
+    r = TAS5825M_REG_RIGHT_TO_LEFT_GAIN; tas5805m_read_bytes(&r, 1, m_r2l, 4);
+    r = TAS5825M_REG_LEFT_TO_RIGHT_GAIN; tas5805m_read_bytes(&r, 1, m_l2r, 4);
+    r = TAS5825M_REG_RIGHT_TO_RIGHT_GAIN;tas5805m_read_bytes(&r, 1, m_r2r, 4);
+    r = TAS5825M_REG_EQ_GANG_ENABLE;     tas5805m_read_bytes(&r, 1, eq_gang, 4);
+    r = TAS5825M_REG_EQ_BYPASS_ENABLE;   tas5805m_read_bytes(&r, 1, eq_byp, 4);
+
+    DUMP_PRINT("[Book 0x8C Page 0x0B - TAS5830M DSP Volume & Mixer Registers]\n");
+    DUMP_PRINT("  0x0C LEFT_VOLUME:   %02X %02X %02X %02X  (Raw=0x%08X)\n",
+               vol_l[0], vol_l[1], vol_l[2], vol_l[3],
+               (vol_l[0]<<24)|(vol_l[1]<<16)|(vol_l[2]<<8)|vol_l[3]);
+    DUMP_PRINT("  0x10 RIGHT_VOLUME:  %02X %02X %02X %02X  (Raw=0x%08X)\n",
+               vol_r[0], vol_r[1], vol_r[2], vol_r[3],
+               (vol_r[0]<<24)|(vol_r[1]<<16)|(vol_r[2]<<8)|vol_r[3]);
+    DUMP_PRINT("  0x14 MIXER L->L:    %02X %02X %02X %02X\n", m_l2l[0], m_l2l[1], m_l2l[2], m_l2l[3]);
+    DUMP_PRINT("  0x18 MIXER R->L:    %02X %02X %02X %02X\n", m_r2l[0], m_r2l[1], m_r2l[2], m_r2l[3]);
+    DUMP_PRINT("  0x1C MIXER L->R:    %02X %02X %02X %02X\n", m_l2r[0], m_l2r[1], m_l2r[2], m_l2r[3]);
+    DUMP_PRINT("  0x20 MIXER R->R:    %02X %02X %02X %02X\n", m_r2r[0], m_r2r[1], m_r2r[2], m_r2r[3]);
+    DUMP_PRINT("  0x28 EQ_GANG:       %02X %02X %02X %02X\n", eq_gang[0], eq_gang[1], eq_gang[2], eq_gang[3]);
+    DUMP_PRINT("  0x2C EQ_BYPASS:     %02X %02X %02X %02X\n\n", eq_byp[0], eq_byp[1], eq_byp[2], eq_byp[3]);
+  }
+
+  TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+
+  const char *mix_str = "Unknown";
+  switch (tas5805m_state.mixer_mode) {
+    case MIXER_STEREO: mix_str = "Stereo"; break;
+    case MIXER_STEREO_INVERSE: mix_str = "Stereo Inverse"; break;
+    case MIXER_MONO: mix_str = "Mono"; break;
+    case MIXER_LEFT: mix_str = "Left only"; break;
+    case MIXER_RIGHT: mix_str = "Right only"; break;
+    default: break;
+  }
+
+  DUMP_PRINT("[Driver In-Memory State]\n");
+  DUMP_PRINT("  Volume Slider:      %d%%\n", tas5805m_state.volume);
+  DUMP_PRINT("  Mixer Mode:         %d (%s)\n", tas5805m_state.mixer_mode, mix_str);
+  DUMP_PRINT("  Channel Gain L:     %d dB\n", tas5805m_state.channel_gain_l);
+  DUMP_PRINT("  Channel Gain R:     %d dB\n", tas5805m_state.channel_gain_r);
+  DUMP_PRINT("  Muted:              %s\n", tas5805m_hw.is_muted ? "YES" : "NO");
+
+  #undef DUMP_PRINT
+  ESP_LOGI(TAG, "\n%s", buf ? buf : "Dump completed");
+  return ESP_OK;
+}
