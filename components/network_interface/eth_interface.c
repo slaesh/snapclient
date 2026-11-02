@@ -279,6 +279,13 @@ static esp_err_t eth_init(esp_eth_handle_t *eth_handles_out[],
   esp_eth_handle_t *eth_handles = NULL;
   uint8_t eth_cnt = 0;
 
+  // Turn on power to the LAN8720 (LilyGO T-COM specific)
+  gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
+  gpio_set_level(GPIO_NUM_4, 1);
+
+  // Give the PHY oscillator 50ms to stabilize
+  vTaskDelay(pdMS_TO_TICKS(50));
+
 #if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
   ESP_GOTO_ON_FALSE(

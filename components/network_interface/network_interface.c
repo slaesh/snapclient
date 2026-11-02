@@ -90,5 +90,5 @@ void network_if_init(void) {
   eth_start();
 #endif
 
-  wifi_start();
+  // wifi_start();
 }
