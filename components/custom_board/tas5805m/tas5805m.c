@@ -476,7 +476,7 @@ esp_err_t tas5805m_set_volume(int vol) {
   float db = 0.0f;
   if (vol == 0) {
     reg_val = (uint8_t)TAS5805M_VOLUME_MUTE;
-    ESP_LOGI(TAG, "Volume set: %d%% -> MUTE (reg 0x%02X)", vol, reg_val);
+    ESP_LOGI(TAG, "Volume set: %d%% slider -> MUTE (reg 0x%02X, 0.00%% amplitude)", vol, reg_val);
   } else {
     /* Linux snapclient uses a cubic volume curve: linear_gain = (vol / 100.0)^3
      * In dB: dB = 20 * log10((vol / 100.0)^3) = 60 * log10(vol / 100.0).
@@ -490,7 +490,10 @@ esp_err_t tas5805m_set_volume(int vol) {
     if (computed > 0xFE) computed = 0xFE;
     reg_val = (uint8_t)computed;
     float actual_db = (float)((int)TAS5805M_VOLUME_MAX - (int)reg_val) * 0.5f;
-    ESP_LOGI(TAG, "Volume set: %d%% -> reg 0x%02X (%.1f dB, target %.1f dB)", vol, reg_val, actual_db, db);
+    float lin_amp_pct = powf(10.0f, actual_db / 20.0f) * 100.0f;
+    float dac_scale_pct = (float)(0xFE - reg_val) / (float)(0xFE - TAS5805M_VOLUME_MAX) * 100.0f;
+    ESP_LOGI(TAG, "Volume set: %d%% slider -> reg 0x%02X (%.1f dB | %.2f%% amplitude | %.1f%% DAC scale)",
+             vol, reg_val, actual_db, lin_amp_pct, dac_scale_pct);
   }
 
   tas5805m_hw.raw_vol = reg_val;
