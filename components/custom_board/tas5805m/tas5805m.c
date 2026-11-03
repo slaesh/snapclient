@@ -367,50 +367,27 @@ static esp_err_t tas5805m_apply_eq_gain_hw(TAS5805M_EQ_CHANNELS channel, int ban
 static esp_err_t tas5805m_apply_eq_profile_hw(TAS5805M_EQ_CHANNELS channel, TAS5805M_EQ_PROFILE profile);
 #endif
 
-// Inits the TAS58xx (mirrors Linux tas58xx_i2c_probe: PDN toggle + DIE_ID detection; DSP boot deferred to tas5805m_ctrl START)
+// Inits the TAS58xx (PDN held LOW; DSP boot and DIE_ID deferred to tas5805m_ctrl START with active I2S clock)
 esp_err_t tas5805m_init() {
-  ESP_LOGD(TAG, "%s: Initializing TAS58xx", __func__);
-  int ret = 0;
+  ESP_LOGI(TAG, "%s: Initializing TAS58xx (holding PDN LOW until I2S clocks start)", __func__);
+
   // Init the I2C-Driver
   i2c_master_init();
+
   /* Register the PDN pin as output with pull-down enabled.
-   * Hold PDN LOW immediately to prevent output glitches during power-up.
+   * Hold PDN LOW immediately to prevent unclocked boot pops.
    */
   gpio_set_level(TAS5805M_GPIO_PDN, 0);
-  gpio_config_t io_conf;
-  io_conf.intr_type = GPIO_INTR_DISABLE;
-  io_conf.mode = GPIO_MODE_OUTPUT;
-  io_conf.pin_bit_mask = TAS5805M_GPIO_PDN_MASK;
-  io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
-  io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-  ESP_LOGI(TAG, "%s: Triggering power down pin: %d (with pull-down)", __func__, TAS5805M_GPIO_PDN);
+  gpio_config_t io_conf = {
+    .intr_type = GPIO_INTR_DISABLE,
+    .mode = GPIO_MODE_OUTPUT,
+    .pin_bit_mask = TAS5805M_GPIO_PDN_MASK,
+    .pull_down_en = GPIO_PULLDOWN_ENABLE,
+    .pull_up_en = GPIO_PULLUP_DISABLE,
+  };
+  ESP_LOGI(TAG, "%s: Configuring power down pin: %d (with pull-down, held LOW)", __func__, TAS5805M_GPIO_PDN);
   gpio_config(&io_conf);
   gpio_set_level(TAS5805M_GPIO_PDN, 0);
-  vTaskDelay(pdMS_TO_TICKS(100));
-  gpio_set_level(TAS5805M_GPIO_PDN, 1);
-  vTaskDelay(pdMS_TO_TICKS(15));
-
-  /* Switch to Book 0 Page 0 and set DEEP SLEEP (0x00) with mute (0xFF) while unclocked.
-   * This tri-states the outputs completely and prevents unclocked analog charge pops during boot.
-   */
-  TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
-  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, TAS5805M_VOLUME_MUTE);
-  ESP_ERROR_CHECK(tas5805m_set_state(TAS5805M_CTRL_DEEP_SLEEP));
-
-  // Detect chip variant via DIE_ID (0x67)
-  uint8_t die_id = 0;
-  if (tas5805m_read_byte(TAS5805M_DIE_ID_REGISTER, &die_id) == ESP_OK) {
-    if (die_id == TAS5830M_DIE_ID) {
-      tas5805m_chip_variant = TAS58XX_CHIP_TAS5830M;
-      ESP_LOGI(TAG, "%s: Detected TAS5830M (DIE_ID=0x%02x)", __func__, die_id);
-    } else {
-      tas5805m_chip_variant = TAS58XX_CHIP_TAS5805M;
-      ESP_LOGI(TAG, "%s: Detected TAS5805M (DIE_ID=0x%02x)", __func__, die_id);
-    }
-  } else {
-    ESP_LOGW(TAG, "%s: Failed to read DIE_ID, defaulting to TAS5805M", __func__);
-    tas5805m_chip_variant = TAS58XX_CHIP_TAS5805M;
-  }
 
   /* Initialize cached state to Linux driver defaults */
   tas5805m_hw.dac_mode = TAS5805M_DAC_MODE_BTL;
@@ -450,7 +427,7 @@ esp_err_t tas5805m_init() {
     ESP_LOGI(TAG, "%s: Fault monitoring task created", __func__);
   }
 
-  return ret;
+  return ESP_OK;
 }
 
 // Getting cached TAS5805 state
@@ -508,6 +485,10 @@ esp_err_t tas5805m_set_volume(int vol) {
   tas5805m_hw.raw_vol = reg_val;
   tas5805m_state.volume = vol;
 
+  if (!tas5805m_hw.is_powered) {
+    return ESP_OK;
+  }
+
   /* Writing the Volume to the Register */
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
   esp_err_t ret = tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, reg_val);
@@ -543,6 +524,9 @@ esp_err_t tas5805m_set_digital_volume(uint8_t vol)
   }
 
   tas5805m_hw.raw_vol = vol;
+  if (!tas5805m_hw.is_powered) {
+    return ESP_OK;
+  }
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
   ret = tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, vol);
   if (ret != ESP_OK)
@@ -715,8 +699,10 @@ static esp_err_t tas5805m_refresh(void) {
 
   /* Step 3: Set Digital Volume (0x4C) and Analog Gain (0x54) */
   tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, tas5805m_hw.raw_vol);
-  /* Configure soft volume ramp rate in DIG_VOL_CTRL2 (0x4E): default 0x33 for smooth transitions */
-  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x33);
+  /* Configure soft volume ramp rate in DIG_VOL_CTRL2 (0x4E): 0x11 = 0.5 dB / 2 samples (~9 ms for 100 dB) */
+  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x11);
+  /* Disable hardware auto-mute on silence (0x50): prevents clicks/pops during fade-outs and quiet song passages */
+  tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x00);
   uint8_t again_idx = tas5805m_hw.again;
   if (again_idx > TAS5805M_MIN_GAIN) again_idx = TAS5805M_MIN_GAIN;
   tas5805m_write_byte(TAS5805M_AGAIN_REGISTER, tas5805m_again[again_idx]);
@@ -803,9 +789,9 @@ esp_err_t tas5805m_ctrl(audio_hal_codec_mode_t mode,
   if (ctrl_state == AUDIO_HAL_CTRL_STOP) {
     ESP_LOGI(TAG, "%s: Stopping DAC -> soft mute -> HI_Z", __func__);
     tas5805m_hw.is_powered = false;
-    /* Soft mute before entering Hi-Z so PWM bridge ramps down without pops */
+    /* Soft mute before entering Hi-Z so PWM bridge ramps down without pops (~9 ms ramp with 0x11) */
     tas5805m_set_state(TAS5805M_CTRL_PLAY_MUTE);
-    vTaskDelay(pdMS_TO_TICKS(6));
+    vTaskDelay(pdMS_TO_TICKS(25));
     return tas5805m_set_state(TAS5805M_CTRL_HI_Z);
   } else if (ctrl_state == AUDIO_HAL_CTRL_START) {
     /* 1. Wait 5-10ms after I2S clock start (Linux: usleep_range(5000, 10000)) */
@@ -813,6 +799,10 @@ esp_err_t tas5805m_ctrl(audio_hal_codec_mode_t mode,
 
     if (!tas5805m_dsp_booted) {
       ESP_LOGI(TAG, "%s: First start (cold boot) with active I2S clock", __func__);
+
+      /* Bring PDN HIGH now that I2S clock is active and stable */
+      gpio_set_level(TAS5805M_GPIO_PDN, 1);
+      vTaskDelay(pdMS_TO_TICKS(15));
 
       /* Send dsp_cfg_preboot (resets DSP & control port in Hi-Z with active I2S clock, sets SDOUT=HIZ) */
       esp_err_t ret = tas58xx_send_cfg(dsp_cfg_preboot, sizeof(dsp_cfg_preboot) / sizeof(dsp_cfg_preboot[0]));

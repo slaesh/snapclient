@@ -2193,6 +2193,16 @@ static void player_task(void *pvParameters) {
         }
       }
     } else {
+      if (scSet.muted) {
+        /* When muted in Snapcast, the server stops transmitting audio chunks.
+         * Keep the I2S clocks active and the player loop alive (amp stays in PLAY_MUTE 0x0B)
+         * so unmuting is instantaneous, perfectly smooth, and completely click-free!
+         */
+        initialSync = 0;
+        vTaskDelay(pdMS_TO_TICKS(50));
+        continue;
+      }
+
       int64_t sec, msec, usec;
 
       sec = diff2Server / 1000000;
