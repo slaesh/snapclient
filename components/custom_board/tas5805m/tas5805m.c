@@ -698,8 +698,8 @@ static esp_err_t tas5805m_refresh(void) {
 
   /* Step 3: Set Digital Volume (0x4C) and Analog Gain (0x54) */
   tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, tas5805m_hw.raw_vol);
-  /* Configure soft volume ramp rate in DIG_VOL_CTRL2 (0x4E): 0x11 = 0.5 dB / 2 samples (~9 ms for 100 dB) */
-  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x11);
+  /* Configure soft volume ramp rate in DIG_VOL_CTRL2 (0x4E): 0x33 = TI default smooth ramp */
+  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x33);
   /* Disable hardware auto-mute on silence (0x50): prevents clicks/pops during fade-outs and quiet song passages */
   tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x00);
   tas5805m_write_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, 0xFF);
