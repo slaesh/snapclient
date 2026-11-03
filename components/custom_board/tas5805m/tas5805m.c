@@ -158,10 +158,9 @@ static void tas5805m_fault_monitor_task(void *pvParameters) {
     // Read fault registers
     esp_err_t ret = tas5805m_get_faults(&fault);
     if (ret == ESP_OK) {
-      // Check if any faults are present (ignore lone clock fault bit 2 while idle)
-      if (fault.err0 || (fault.err1 & ~(1 << 2)) || fault.err2 || fault.ot_warn) {
-        ESP_LOGW(TAG, "Faults detected: err0=0x%02x, err1=0x%02x, err2=0x%02x, ot_warn=0x%02x",
-                 fault.err0, fault.err1, fault.err2, fault.ot_warn);
+      if (fault.err0 || fault.err1 || fault.err2 || fault.ot_warn) {
+        ESP_LOGW(TAG, "Faults detected while powered: chan_err=0x%02x, global1=0x%02x (clk_fault=%d, dc_fault=%d), global2=0x%02x, ot_warn=0x%02x",
+                 fault.err0, fault.err1, (fault.err1 >> 2) & 1, fault.err1 & 1, fault.err2, fault.ot_warn);
         
         // Decode and log the faults
         tas5805m_decode_faults(fault);
@@ -178,8 +177,8 @@ static void tas5805m_fault_monitor_task(void *pvParameters) {
       ESP_LOGE(TAG, "Failed to read faults: %s", esp_err_to_name(ret));
     }
     
-    // Wait for 5 seconds
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // Check every second while powered
+    vTaskDelay(pdMS_TO_TICKS(1000));
   }
 }
 
