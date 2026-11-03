@@ -116,6 +116,7 @@ typedef struct audioDACdata_s {
 static audioDACdata_t audioDAC_data;
 static QueueHandle_t audioDACQHdl = NULL;
 static SemaphoreHandle_t audioDACSemaphore = NULL;
+static audio_board_handle_t g_board_handle = NULL;
 
 void time_sync_msg_cb(void *args);
 
@@ -515,6 +516,15 @@ void audio_dac_enable(bool enabled) {
   xSemaphoreTake(audioDACSemaphore, portMAX_DELAY);
   if (enabled != audioDAC_data.enabled) {
     audioDAC_data.enabled = enabled;
+    /* If stopping, execute synchronously right now so the DAC enters Hi-Z
+     * BEFORE high-priority tasks (e.g. player_task) cut the I2S clocks!
+     */
+    if (!enabled && g_board_handle && g_board_handle->audio_hal) {
+      audio_hal_set_mute(g_board_handle->audio_hal, true);
+      audio_hal_ctrl_codec(g_board_handle->audio_hal,
+                           AUDIO_HAL_CODEC_MODE_DECODE,
+                           AUDIO_HAL_CTRL_STOP);
+    }
     xQueueOverwrite(audioDACQHdl, &audioDAC_data);
   }
   xSemaphoreGive(audioDACSemaphore);
@@ -1319,23 +1329,31 @@ static void dac_control_task(audio_board_handle_t board_handle,
   // audio_board_handle_t?
   while (1) {
     if (xQueueReceive(audioQHdl, &dac_data, portMAX_DELAY) == pdTRUE) {
-      if (dac_data.mute != dac_data_old.mute) {
-        audio_hal_set_mute(board_handle->audio_hal, dac_data.mute);
+      /* If disabling DAC: mute & stop FIRST before any other state changes */
+      if (dac_data.enabled != dac_data_old.enabled && !dac_data.enabled) {
+        audio_hal_set_mute(board_handle->audio_hal, true);
+        audio_hal_ctrl_codec(board_handle->audio_hal,
+                             AUDIO_HAL_CODEC_MODE_DECODE,
+                             AUDIO_HAL_CTRL_STOP);
       }
+
+      /* Apply volume change */
       if (dac_data.volume != dac_data_old.volume) {
         audio_hal_set_volume(board_handle->audio_hal, dac_data.volume);
       }
-      if (dac_data.enabled != dac_data_old.enabled) {
-        if (dac_data.enabled) {
-          audio_hal_ctrl_codec(board_handle->audio_hal,
-                               AUDIO_HAL_CODEC_MODE_DECODE,
-                               AUDIO_HAL_CTRL_START);
-        } else {
-          audio_hal_ctrl_codec(board_handle->audio_hal,
-                               AUDIO_HAL_CODEC_MODE_DECODE,
-                               AUDIO_HAL_CTRL_STOP);
-        }
+
+      /* If enabling DAC: START codec (wait clock lock) FIRST, then apply mute */
+      if (dac_data.enabled != dac_data_old.enabled && dac_data.enabled) {
+        audio_hal_ctrl_codec(board_handle->audio_hal,
+                             AUDIO_HAL_CODEC_MODE_DECODE,
+                             AUDIO_HAL_CTRL_START);
       }
+
+      /* If DAC is enabled, apply mute state */
+      if (dac_data.enabled && (dac_data.mute != dac_data_old.mute || dac_data.enabled != dac_data_old.enabled)) {
+        audio_hal_set_mute(board_handle->audio_hal, dac_data.mute);
+      }
+
       dac_data_old = dac_data;
     }
   }
@@ -1448,6 +1466,7 @@ void app_main(void) {
 
   ESP_LOGI(TAG, "Start codec chip");
   audio_board_handle_t board_handle = audio_board_init();
+  g_board_handle = board_handle;
   if (board_handle) {
     ESP_LOGI(TAG, "Audio board_init done");
   } else {

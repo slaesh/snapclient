@@ -140,6 +140,8 @@ static int64_t MIN(int64_t x, int64_t y) {
 esp_err_t my_i2s_channel_disable(i2s_chan_handle_t handle) {
   if (tx_chan != NULL) {
     if (i2sEnabled == true) {
+      /* Safely stop DAC before cutting I2S clocks to prevent pops/screeches */
+      audio_dac_enable(false);
       i2sEnabled = false;
 
       return i2s_channel_disable(handle);
@@ -1575,7 +1577,7 @@ static void player_task(void *pvParameters) {
 //
 //    ESP_LOGI(TAG, "created new queue with %d", entries);
 //  }
-  audio_set_mute(scSet.muted);
+  /* Keep mute active until initial sync and clock locking is complete */
 
   // wait for early time syncs to be ready
   xSemaphoreTake(latencyBufFullSemaphoreHandle, portMAX_DELAY);

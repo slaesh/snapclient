@@ -114,6 +114,9 @@ static const tas58xx_cfg_reg_t dsp_cfg_preboot_gpio_config[] = {
 
 static esp_err_t tas5805m_refresh(void);
 
+// Tracks whether the DSP and initial registers have undergone full cold boot
+static bool tas5805m_dsp_booted = false;
+
 /* Task handle for fault monitoring */
 static TaskHandle_t tas5805m_fault_monitor_task_handle = NULL;
 
@@ -370,23 +373,28 @@ esp_err_t tas5805m_init() {
   int ret = 0;
   // Init the I2C-Driver
   i2c_master_init();
-  /* Register the PDN pin as output and toggle to reset/power up the TAS chip (Linux: 100ms low, 15ms high) */
+  /* Register the PDN pin as output with pull-down enabled.
+   * Hold PDN LOW immediately to prevent output glitches during power-up.
+   */
+  gpio_set_level(TAS5805M_GPIO_PDN, 0);
   gpio_config_t io_conf;
   io_conf.intr_type = GPIO_INTR_DISABLE;
   io_conf.mode = GPIO_MODE_OUTPUT;
   io_conf.pin_bit_mask = TAS5805M_GPIO_PDN_MASK;
-  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;
   io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
-  ESP_LOGI(TAG, "%s: Triggering power down pin: %d", __func__, TAS5805M_GPIO_PDN);
+  ESP_LOGI(TAG, "%s: Triggering power down pin: %d (with pull-down)", __func__, TAS5805M_GPIO_PDN);
   gpio_config(&io_conf);
   gpio_set_level(TAS5805M_GPIO_PDN, 0);
   vTaskDelay(pdMS_TO_TICKS(100));
   gpio_set_level(TAS5805M_GPIO_PDN, 1);
   vTaskDelay(pdMS_TO_TICKS(15));
 
-  /* Switch to Book 0 Page 0 and enter Hi-Z so we can read DIE_ID */
+  /* Switch to Book 0 Page 0 and enter Hi-Z so we can read DIE_ID safely without output power */
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
   ESP_ERROR_CHECK(tas5805m_set_state(TAS5805M_CTRL_HI_Z));
+  /* Start with hardware volume at mute (0xFF) */
+  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, TAS5805M_VOLUME_MUTE);
 
   // Detect chip variant via DIE_ID (0x67)
   uint8_t die_id = 0;
@@ -567,6 +575,7 @@ esp_err_t tas5805m_get_digital_volume(uint8_t *vol)
 // Deinit the TAS5805M
 esp_err_t tas5805m_deinit(void) {
   tas5805m_hw.is_powered = false;
+  tas5805m_dsp_booted = false;
   /* Stop fault monitoring task */
   if (tas5805m_fault_monitor_task_handle != NULL) {
     vTaskDelete(tas5805m_fault_monitor_task_handle);
@@ -789,47 +798,56 @@ esp_err_t tas5805m_ctrl(audio_hal_codec_mode_t mode,
   ESP_LOGI(TAG, "%s: Control state: %d", __func__, ctrl_state);
 
   if (ctrl_state == AUDIO_HAL_CTRL_STOP) {
-    ESP_LOGI(TAG, "%s: Stopping DAC -> setting HI_Z", __func__);
+    ESP_LOGI(TAG, "%s: Stopping DAC -> soft mute -> HI_Z", __func__);
     tas5805m_hw.is_powered = false;
+    /* Soft mute before entering Hi-Z so PWM bridge ramps down without pops */
+    tas5805m_set_state(TAS5805M_CTRL_PLAY_MUTE);
+    vTaskDelay(pdMS_TO_TICKS(6));
     return tas5805m_set_state(TAS5805M_CTRL_HI_Z);
   } else if (ctrl_state == AUDIO_HAL_CTRL_START) {
-    ESP_LOGI(TAG, "%s: Starting DAC (Linux do_work sequence with active I2S clock)", __func__);
-
-    /* 1. Wait 5-10ms after I2S clock start before DSP preboot (Linux: usleep_range(5000, 10000)) */
+    /* 1. Wait 5-10ms after I2S clock start (Linux: usleep_range(5000, 10000)) */
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    /* 2. Send dsp_cfg_preboot (resets DSP & control port in Hi-Z with active I2S clock, sets SDOUT=HIZ) */
-    esp_err_t ret = tas58xx_send_cfg(dsp_cfg_preboot, sizeof(dsp_cfg_preboot) / sizeof(dsp_cfg_preboot[0]));
-    if (ret != ESP_OK) {
-      ESP_LOGE(TAG, "%s: Failed sending dsp_cfg_preboot", __func__);
-      return ret;
-    }
+    if (!tas5805m_dsp_booted) {
+      ESP_LOGI(TAG, "%s: First start (cold boot) with active I2S clock", __func__);
 
-    /* 3. Read DIE_ID (0x67) to confirm chip model */
-    uint8_t die_id = 0;
-    if (tas5805m_read_byte(TAS5805M_DIE_ID_REGISTER, &die_id) == ESP_OK) {
-      if (die_id == TAS5830M_DIE_ID) {
-        tas5805m_chip_variant = TAS58XX_CHIP_TAS5830M;
-      } else {
-        tas5805m_chip_variant = TAS58XX_CHIP_TAS5805M;
+      /* Send dsp_cfg_preboot (resets DSP & control port in Hi-Z with active I2S clock, sets SDOUT=HIZ) */
+      esp_err_t ret = tas58xx_send_cfg(dsp_cfg_preboot, sizeof(dsp_cfg_preboot) / sizeof(dsp_cfg_preboot[0]));
+      if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "%s: Failed sending dsp_cfg_preboot", __func__);
+        return ret;
       }
-      ESP_LOGI(TAG, "%s: Chip DIE_ID=0x%02x (%s)", __func__, die_id,
-               tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M ? "TAS5830M" : "TAS5805M");
+
+      /* Read DIE_ID (0x67) to confirm chip model */
+      uint8_t die_id = 0;
+      if (tas5805m_read_byte(TAS5805M_DIE_ID_REGISTER, &die_id) == ESP_OK) {
+        if (die_id == TAS5830M_DIE_ID) {
+          tas5805m_chip_variant = TAS58XX_CHIP_TAS5830M;
+        } else {
+          tas5805m_chip_variant = TAS58XX_CHIP_TAS5805M;
+        }
+        ESP_LOGI(TAG, "%s: Chip DIE_ID=0x%02x (%s)", __func__, die_id,
+                 tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M ? "TAS5830M" : "TAS5805M");
+      }
+
+      /* Configure GPIO pins for TAS5830M/TAS5825M (matches Linux dsp_cfg_preboot_gpio_config) */
+      if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+        tas58xx_send_cfg(dsp_cfg_preboot_gpio_config,
+                         sizeof(dsp_cfg_preboot_gpio_config) / sizeof(dsp_cfg_preboot_gpio_config[0]));
+      }
+
+      /* Wait 5-10ms for DSP to boot out of reset with active I2S clocks */
+      vTaskDelay(pdMS_TO_TICKS(10));
+
+      /* Refresh all analog & DSP registers while in Hi-Z (Book 0x00, Book 0x8C, Book 0xAA) */
+      tas5805m_refresh();
+
+      tas5805m_dsp_booted = true;
+    } else {
+      ESP_LOGI(TAG, "%s: Warm resume (DSP already booted) - releasing soft-mute", __func__);
     }
 
-    /* 4. Configure GPIO pins for TAS5830M/TAS5825M (matches Linux dsp_cfg_preboot_gpio_config) */
-    if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
-      tas58xx_send_cfg(dsp_cfg_preboot_gpio_config,
-                       sizeof(dsp_cfg_preboot_gpio_config) / sizeof(dsp_cfg_preboot_gpio_config[0]));
-    }
-
-    /* 5. Wait 5-10ms for DSP to boot out of reset with active I2S clocks */
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    /* 6. Refresh all analog & DSP registers while in Hi-Z (Book 0x00, Book 0x8C, Book 0xAA) */
-    tas5805m_refresh();
-
-    /* 7. Enter PLAY + MUTE (0x0B), wait for clock lock, then unmute to PLAY (0x03) */
+    /* Enter PLAY + MUTE (0x0B), wait for clock lock, then unmute to PLAY (0x03) */
     tas5805m_set_state(TAS5805M_CTRL_PLAY_MUTE);
     tas5805m_hw.is_powered = true;
     tas5805m_wait_clock_stable();
