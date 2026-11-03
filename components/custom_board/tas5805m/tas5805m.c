@@ -715,6 +715,8 @@ static esp_err_t tas5805m_refresh(void) {
 
   /* Step 3: Set Digital Volume (0x4C) and Analog Gain (0x54) */
   tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, tas5805m_hw.raw_vol);
+  /* Configure soft volume ramp rate in DIG_VOL_CTRL2 (0x4E): default 0x33 for smooth transitions */
+  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x33);
   uint8_t again_idx = tas5805m_hw.again;
   if (again_idx > TAS5805M_MIN_GAIN) again_idx = TAS5805M_MIN_GAIN;
   tas5805m_write_byte(TAS5805M_AGAIN_REGISTER, tas5805m_again[again_idx]);

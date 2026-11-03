@@ -391,10 +391,11 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
 
   i2s_std_clk_config_t i2s_clkcfg = I2S_STD_CLK_DEFAULT_CONFIG(sr);
 
-#if SOC_I2S_SUPPORTS_APLL
-  /* Always use low-jitter fractional APLL when supported (ESP32), matching Linux PLL */
+#if SOC_I2S_SUPPORTS_APLL && !defined(CONFIG_ETH_RMII_CLK_OUTPUT)
+  /* Use APLL when available and not occupied by Ethernet RMII 50MHz clock */
   i2s_clkcfg.clk_src = I2S_CLK_SRC_APLL;
 #else
+  /* Ethernet uses APLL at 50MHz; I2S must use standard PLL_F160M / APB clock */
   i2s_clkcfg.clk_src = I2S_CLK_SRC_DEFAULT;
 #endif
 
