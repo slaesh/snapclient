@@ -703,6 +703,11 @@ static esp_err_t tas5805m_refresh(void) {
   tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x11);
   /* Disable hardware auto-mute on silence (0x50): prevents clicks/pops during fade-outs and quiet song passages */
   tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x00);
+  tas5805m_write_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, 0xFF);
+  uint8_t am_val = 0xFF;
+  tas5805m_read_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, &am_val);
+  ESP_LOGI(TAG, "%s: Hardware Auto-Mute (0x50): written 0x00, verified readback 0x%02X (%s)",
+           __func__, am_val, am_val == 0x00 ? "DISABLED (noiseless silence)" : "ENABLED");
   uint8_t again_idx = tas5805m_hw.again;
   if (again_idx > TAS5805M_MIN_GAIN) again_idx = TAS5805M_MIN_GAIN;
   tas5805m_write_byte(TAS5805M_AGAIN_REGISTER, tas5805m_again[again_idx]);
@@ -838,6 +843,12 @@ esp_err_t tas5805m_ctrl(audio_hal_codec_mode_t mode,
       tas5805m_dsp_booted = true;
     } else {
       ESP_LOGI(TAG, "%s: Warm resume (DSP already booted) - releasing soft-mute", __func__);
+      TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+      tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x00);
+      uint8_t am_val = 0xFF;
+      tas5805m_read_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, &am_val);
+      ESP_LOGI(TAG, "%s: Warm resume Auto-Mute (0x50) verified: 0x%02X (%s)",
+               __func__, am_val, am_val == 0x00 ? "DISABLED" : "ENABLED");
     }
 
     /* Enter PLAY + MUTE (0x0B), wait for clock lock, then unmute to PLAY (0x03) */

@@ -2139,12 +2139,16 @@ static void player_task(void *pvParameters) {
               dir = -1;
               dir_insert_sample = -1;
               insertedSamplesCounter += INSERT_SAMPLES;
+              ESP_LOGI(TAG, "Sync adjust: inserting %d sample(s) (shortMedian=%lld, age=%lld)",
+                       INSERT_SAMPLES, shortMedian, age);
             } else if ((shortMedian > shortOffset) &&
                        (miniMedian > miniOffset) &&
                        (age > miniOffset)) {  // we are late
               dir = 1;
               dir_insert_sample = 1;
               insertedSamplesCounter -= INSERT_SAMPLES;
+              ESP_LOGI(TAG, "Sync adjust: dropping %d sample(s) (shortMedian=%lld, age=%lld)",
+                       INSERT_SAMPLES, shortMedian, age);
             }
           }
 #else  // use APLL to adjust sync
