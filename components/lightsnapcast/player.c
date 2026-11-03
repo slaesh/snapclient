@@ -433,8 +433,10 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
 #endif
 
   ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_chan, &tx_std_cfg));
-  // This prevents pops/clicks on some I2S codecs
+#if !CONFIG_DAC_TAS5805M
+  // This prevents pops/clicks on some I2S codecs like ES8388, but causes clock glitches on TAS58xx
   ensure_noiseless(tx_chan);
+#endif
 
   // my_i2s_channel_enable(tx_chan);
 
@@ -2093,11 +2095,11 @@ static void player_task(void *pvParameters) {
           int msgWaiting = uxQueueMessagesWaiting(pcmChkQHdl);
 
           // resync hard if we are getting very late / early.
-          // rest gets tuned in through apll speed control or sample insertion
-          if ((msgWaiting == 0) ||
-              (MEDIANFILTER_isFull(&shortMedianFilter, 0) &&
-               ((shortMedian > hardResyncThreshold) ||
-                (shortMedian < -hardResyncThreshold)))) 
+          // rest gets tuned in through apll speed control or sample insertion.
+          // NOTE: Do not hard resync just because msgWaiting == 0 (brief gap between tracks/packets)!
+          if (MEDIANFILTER_isFull(&shortMedianFilter, 0) &&
+              ((shortMedian > hardResyncThreshold) ||
+               (shortMedian < -hardResyncThreshold))) 
           {
             if (chnk != NULL) {
               free_pcm_chunk(chnk);

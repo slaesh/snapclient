@@ -390,11 +390,12 @@ esp_err_t tas5805m_init() {
   gpio_set_level(TAS5805M_GPIO_PDN, 1);
   vTaskDelay(pdMS_TO_TICKS(15));
 
-  /* Switch to Book 0 Page 0 and enter Hi-Z so we can read DIE_ID safely without output power */
+  /* Switch to Book 0 Page 0 and set DEEP SLEEP (0x00) with mute (0xFF) while unclocked.
+   * This tri-states the outputs completely and prevents unclocked analog charge pops during boot.
+   */
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
-  ESP_ERROR_CHECK(tas5805m_set_state(TAS5805M_CTRL_HI_Z));
-  /* Start with hardware volume at mute (0xFF) */
   tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, TAS5805M_VOLUME_MUTE);
+  ESP_ERROR_CHECK(tas5805m_set_state(TAS5805M_CTRL_DEEP_SLEEP));
 
   // Detect chip variant via DIE_ID (0x67)
   uint8_t die_id = 0;
@@ -462,7 +463,7 @@ esp_err_t tas5805m_get_state(TAS5805_STATE *out_state)
 // Setting the DAC State of TAS5805M
 esp_err_t tas5805m_set_state(TAS5805M_CTRL_STATE state)
 {
-  ESP_LOGD(TAG, "%s: Setting state to 0x%x", __func__, state);
+  ESP_LOGI(TAG, "%s: Setting state to 0x%02X", __func__, state);
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
   esp_err_t ret = tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, state);
   if (ret == ESP_OK) {
@@ -591,7 +592,7 @@ esp_err_t tas5805m_deinit(void) {
 
 // Setting mute state (matches Linux tas58xx_dac_mute)
 esp_err_t tas5805m_set_mute(bool enable) {
-  ESP_LOGD(TAG, "%s: Setting mute to %d", __func__, enable);
+  ESP_LOGI(TAG, "%s: Setting mute to %d (is_powered=%d)", __func__, enable, tas5805m_hw.is_powered);
   tas5805m_hw.is_muted = enable;
 
   if (!tas5805m_hw.is_powered) {

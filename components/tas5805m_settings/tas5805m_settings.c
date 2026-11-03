@@ -43,19 +43,21 @@ static bool tas5805m_i2s_clock_ready = false;
 static void tas5805m_poll_for_play_task(void *arg)
 {
     (void)arg;
-    const TickType_t poll_interval = pdMS_TO_TICKS(200);
+    const TickType_t poll_interval = pdMS_TO_TICKS(100);
 
     ESP_LOGI(TAG, "%s: Polling for codec PLAY state (no timeout)", __func__);
 
     for (;;) {
         TAS5805_STATE st;
         if (tas5805m_get_state(&st) == ESP_OK) {
+            /* Wait until the codec has completed DSP initialization and entered PLAY */
             if ((st.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY) {
                 ESP_LOGI(TAG, "%s: Codec entered PLAY — applying delayed persisted settings", __func__);
                 // Call delayed apply (requires codec to be running)
                 esp_err_t r = tas5805m_settings_apply_delayed();
                 if (r == ESP_OK) {
                     tas5805m_settings_restored = true;
+                    ESP_LOGI(TAG, "%s: Persisted settings successfully applied without glitch", __func__);
                 } else {
                     ESP_LOGW(TAG, "%s: tas5805m_settings_apply_delayed() returned %s", __func__, esp_err_to_name(r));
                 }
