@@ -19,7 +19,9 @@
 
 #include "esp_log.h"
 #include "esp_netif.h"
+#if CONFIG_SOC_WIFI_SUPPORTED
 #include "esp_wifi.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "i2s.h"
 #include "lwip/api.h"

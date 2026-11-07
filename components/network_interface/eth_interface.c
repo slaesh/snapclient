@@ -81,18 +81,39 @@ static esp_eth_handle_t eth_init_internal(esp_eth_mac_t **mac_out,
   eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
 
   // Update PHY config based on board specific configuration
+#ifdef CONFIG_SNAPCLIENT_ETH_PHY_ADDR
+  phy_config.phy_addr = CONFIG_SNAPCLIENT_ETH_PHY_ADDR;
+#else
   phy_config.phy_addr = 0;
+#endif
+
+#ifdef CONFIG_SNAPCLIENT_ETH_PHY_RST_GPIO
+  phy_config.reset_gpio_num = CONFIG_SNAPCLIENT_ETH_PHY_RST_GPIO;
+#else
   phy_config.reset_gpio_num = 5;
+#endif
 
   // Init vendor specific MAC config to default
   eth_esp32_emac_config_t esp32_emac_config = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+
+#if !CONFIG_IDF_TARGET_ESP32P4
   // Update vendor specific MAC config based on board configuration
-  esp32_emac_config.smi_mdc_gpio_num = 23;
-  esp32_emac_config.smi_mdio_gpio_num = 18;
+#ifdef CONFIG_SNAPCLIENT_ETH_MDC_GPIO
+  esp32_emac_config.smi_gpio.mdc_num = CONFIG_SNAPCLIENT_ETH_MDC_GPIO;
+#else
+  esp32_emac_config.smi_gpio.mdc_num = 23;
+#endif
+
+#ifdef CONFIG_SNAPCLIENT_ETH_MDIO_GPIO
+  esp32_emac_config.smi_gpio.mdio_num = CONFIG_SNAPCLIENT_ETH_MDIO_GPIO;
+#else
+  esp32_emac_config.smi_gpio.mdio_num = 18;
+#endif
 
   // Set clock mode and GPIO
   esp32_emac_config.clock_config.rmii.clock_mode = EMAC_CLK_OUT;
   esp32_emac_config.clock_config.rmii.clock_gpio = 0;
+#endif
 
   // Create new ESP32 Ethernet MAC instance
   esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_emac_config, &mac_config);
@@ -271,9 +292,11 @@ static esp_err_t eth_init(esp_eth_handle_t *eth_handles_out[],
   esp_eth_handle_t *eth_handles = NULL;
   uint8_t eth_cnt = 0;
 
+#if !CONFIG_IDF_TARGET_ESP32P4 && CONFIG_SNAPCLIENT_ETH_PHY_LAN87XX
   // Turn on power to the LAN8720 (LilyGO T-COM specific)
   gpio_set_direction(GPIO_NUM_4, GPIO_MODE_OUTPUT);
   gpio_set_level(GPIO_NUM_4, 1);
+#endif
 
   // Give the PHY oscillator 50ms to stabilize
   vTaskDelay(pdMS_TO_TICKS(50));

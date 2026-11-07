@@ -18,7 +18,6 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
-#include "esp_wifi_types.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
@@ -29,7 +28,10 @@
 #include "eth_interface.h"
 #endif
 
+#if CONFIG_SOC_WIFI_SUPPORTED
+#include "esp_wifi_types.h"
 #include "wifi_interface.h"
+#endif
 
 static const char *TAG = "NET_IF";
 
@@ -74,9 +76,11 @@ bool network_if_get_ip(esp_netif_ip_info_t *ip) {
   }
 #endif
 
+#if CONFIG_SOC_WIFI_SUPPORTED
   if (wifi_get_ip(ip) == true) {
     return true;
   }
+#endif
 
   return false;
 }

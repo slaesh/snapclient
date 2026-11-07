@@ -1,6 +1,7 @@
 #include <stdint.h>
 #include <string.h>
 
+
 #include "board.h"
 #include "driver/timer_types_legacy.h"
 #include "esp_event.h"
@@ -11,7 +12,9 @@
 #include "esp_pm.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#if CONFIG_SOC_WIFI_SUPPORTED
 #include "esp_wifi.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/idf_additions.h"
@@ -1380,16 +1383,19 @@ void app_main(void) {
   esp_log_level_set("uart", ESP_LOG_WARN);
   // esp_log_level_set("i2s_std", ESP_LOG_DEBUG);
   // esp_log_level_set("i2s_common", ESP_LOG_DEBUG);
+#if CONFIG_SOC_WIFI_SUPPORTED
   esp_log_level_set("wifi", ESP_LOG_WARN);
   esp_log_level_set("wifi_init", ESP_LOG_WARN);
+#endif
   esp_log_level_set("httpd_uri", ESP_LOG_WARN);
   esp_log_level_set("settings", ESP_LOG_DEBUG);
   esp_log_level_set("dsp_settings", ESP_LOG_DEBUG);
   esp_log_level_set("UI_HTTP", ESP_LOG_WARN);
   esp_log_level_set("dspProc", ESP_LOG_DEBUG);
 
-#if CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
-    CONFIG_SNAPCLIENT_USE_SPI_ETHERNET
+#if (CONFIG_SNAPCLIENT_USE_INTERNAL_ETHERNET || \
+     CONFIG_SNAPCLIENT_USE_SPI_ETHERNET) && \
+    !CONFIG_IDF_TARGET_ESP32P4 && CONFIG_SNAPCLIENT_ETH_PHY_LAN87XX
   // clang-format off
   // nINT/REFCLKO Function Select Configuration Strap
   //  • When nINTSEL is floated or pulled to

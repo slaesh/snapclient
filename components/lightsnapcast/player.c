@@ -17,7 +17,9 @@
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#if CONFIG_SOC_WIFI_SUPPORTED
 #include "esp_wifi.h"
+#endif
 #include "soc/rtc.h"
 
 #if SOC_I2S_SUPPORTS_APLL
@@ -129,10 +131,6 @@ static bool i2sEnabled = false;
 i2s_std_gpio_config_t pin_config0;
 i2s_port_t i2sNum;
 
-// Function to find the minimum using ternary operator
-static int64_t MIN(int64_t x, int64_t y) {
-    return (x < y) ? x : y;
-}
 
 /**
  *
@@ -384,11 +382,6 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
   };
   ESP_ERROR_CHECK(i2s_new_channel(&tx_chan_cfg, &tx_chan, NULL));
 
-  ESP_LOGI(TAG,
-           "player_setup_i2s: dma_buf_len is %ld, dma_buf_count is %ld, sample "
-           "rate: %ld, bits: %d",
-           i2sDmaBufMaxLen, i2sDmaBufCnt, sr, bits);
-
   i2s_std_clk_config_t i2s_clkcfg = I2S_STD_CLK_DEFAULT_CONFIG(sr);
 
 #if SOC_I2S_SUPPORTS_APLL && !defined(CONFIG_ETH_RMII_CLK_OUTPUT)
@@ -398,6 +391,11 @@ static esp_err_t player_setup_i2s(snapcastSetting_t *setting) {
   /* Ethernet uses APLL at 50MHz; I2S must use standard PLL_F160M / APB clock */
   i2s_clkcfg.clk_src = I2S_CLK_SRC_DEFAULT;
 #endif
+
+  ESP_LOGI(TAG,
+           "player_setup_i2s: dma_buf_len is %ld, dma_buf_count is %ld, sample "
+           "rate: %ld, bits: %d, clk_src: %d, mclk_mult: %d",
+           i2sDmaBufMaxLen, i2sDmaBufCnt, sr, bits, (int)i2s_clkcfg.clk_src, (int)i2s_clkcfg.mclk_multiple);
 
 #if CONFIG_DAC_TAS5805M
   /* TAS58xx requires 32-bit I2S framing (SNDRV_PCM_FMTBIT_S32_LE, BCLK = 64 * fs = 3.072 MHz)
@@ -1833,8 +1831,13 @@ static void player_task(void *pvParameters) {
             chnk = NULL;
           }
 
-          wifi_ap_record_t ap;
+#if CONFIG_SOC_WIFI_SUPPORTED
+          wifi_ap_record_t ap = {0};
           esp_wifi_sta_get_ap_info(&ap);
+          int8_t rssi = ap.rssi;
+#else
+          int8_t rssi = 0;
+#endif
 
           my_gptimer_stop(gptimer);
           
@@ -1844,7 +1847,7 @@ static void player_task(void *pvParameters) {
                    "RESYNCING HARD 1: age %lldus, latency %lldus, free %d, "
                    "largest block %d, rssi: %d, left in queue %d",
                    age, diff2Server, heap_caps_get_free_size(MALLOC_CAP_32BIT),
-                   heap_caps_get_largest_free_block(MALLOC_CAP_32BIT), ap.rssi, msgWaiting);
+                   heap_caps_get_largest_free_block(MALLOC_CAP_32BIT), rssi, msgWaiting);
                    
           // get count of chunks we are late for
           uint32_t c = ceil((float)age / (float)chunkDuration_us);  // round up
@@ -1876,7 +1879,7 @@ static void player_task(void *pvParameters) {
 
       const int64_t shortOffset = SHORT_OFFSET;  // µs, softsync
       const int64_t miniOffset = MINI_OFFSET;    // µs, softsync
-      const int64_t hardResyncThreshold = 2000;  // µs, hard sync
+      const int64_t hardResyncThreshold = 25000; // µs, hard sync (~1 chunk margin)
 
       if (initialSync == 1) {
         if (size == 0) {
@@ -2079,14 +2082,18 @@ static void player_task(void *pvParameters) {
             // Ideal playout time based on local audio clock                    
             int64_t actual_play_local_us = playback_start_time_us + (int64_t)((samples_played * 1000000ll) / (int64_t)scSet.sr);
             int64_t error_us = actual_play_local_us - target_play_local_us;
-            // ESP_LOGI(TAG, "%lld", error_us);
 
-            age = error_us;
+            // Standard Snapcast age calculation (jitter/packet latency relative to playout schedule)
+            age = serverNow - chunkStart - buf_us + clientDacLatency_us +
+                  outputBufferDacTime_us;
+
+            static uint32_t sync_log_count = 0;
+            if (++sync_log_count % 25 == 0) {
+              ESP_LOGI(TAG, "SYNC: snap_age=%lldus, err_us=%lldus, now=%lld, play_start=%lld, target=%lld, actual=%lld, played=%lld, written=%lld, diff2Srv=%lld",
+                       age, error_us, now_us, playback_start_time_us, target_play_local_us, actual_play_local_us,
+                       samples_played, samples_written, diff2Server);
+            }
           }
-          
-          
-//          age = serverNow - chunkStart - buf_us + clientDacLatency_us +
-//                outputBufferDacTime_us;
 
           int64_t shortMedian, miniMedian;
 
@@ -2107,8 +2114,13 @@ static void player_task(void *pvParameters) {
               chnk = NULL;
             }
 
-            wifi_ap_record_t ap;
+#if CONFIG_SOC_WIFI_SUPPORTED
+            wifi_ap_record_t ap = {0};
             esp_wifi_sta_get_ap_info(&ap);
+            int8_t rssi = ap.rssi;
+#else
+            int8_t rssi = 0;
+#endif
 
             ESP_LOGW(TAG,
                      "RESYNCING HARD 2: age %lldus, latency %lldus, free "
@@ -2116,7 +2128,7 @@ static void player_task(void *pvParameters) {
                      age, diff2Server,
                      heap_caps_get_free_size(MALLOC_CAP_32BIT),
                      heap_caps_get_largest_free_block(MALLOC_CAP_32BIT),
-                     msgWaiting, ap.rssi);
+                     msgWaiting, rssi);
 
             my_gptimer_stop(gptimer);
 

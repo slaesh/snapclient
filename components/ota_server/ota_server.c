@@ -16,7 +16,9 @@
 #include "esp_log.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#if CONFIG_SOC_WIFI_SUPPORTED
 #include "esp_wifi.h"
+#endif
 #include "lwip/sockets.h"
 #include "ota_server.h"
 #include "player.h"
