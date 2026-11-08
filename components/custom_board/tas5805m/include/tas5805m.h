@@ -432,6 +432,16 @@ esp_err_t tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS channel, int band,
 									   int gain);
 
 /**
+ * @brief Begin a batch EQ update (holds codec in Hi-Z for glitch-free updates)
+ */
+void tas5805m_eq_batch_begin(void);
+
+/**
+ * @brief End a batch EQ update (restores codec to previous play state)
+ */
+void tas5805m_eq_batch_end(void);
+
+/**
  * @brief Get the current EQ profile of the TAS5805M
  *
  * @param profile: Pointer to the profile variable

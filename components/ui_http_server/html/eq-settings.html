@@ -596,7 +596,18 @@
         modeChanged = true;
       }
 
+      // In standard 15-band stereo mode (mode 1), mirror curve to right channel as well
+      if (currentSettings.eq_ui_mode === 1) {
+        for (let i = 0; i < 15; i++) {
+          update[`eq_gain_r_${i}`] = curve[i];
+          currentSettings[`eq_gain_r_${i}`] = curve[i];
+        }
+      }
+
       updateSlidersInDOM(channel, curve);
+      if (currentSettings.eq_ui_mode === 1) {
+        updateSlidersInDOM('right', curve);
+      }
       updatePresetActiveState(channel);
 
       try {
@@ -666,6 +677,10 @@
       }
 
       content.appendChild(container);
+
+      // Evaluate active preset highlights now that all elements are attached to DOM
+      updatePresetActiveState('left');
+      updatePresetActiveState('right');
     }
 
     // Render a parameter group

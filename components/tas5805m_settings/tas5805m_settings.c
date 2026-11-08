@@ -1196,13 +1196,13 @@ esp_err_t tas5805m_settings_set_from_json(const char *json_in) {
         }
 
         // Immediately apply persisted data according to selected UI mode
+        tas5805m_eq_batch_begin();
         if (ui == TAS5805M_EQ_UI_MODE_15_BAND) {
             for (int band = 0; band < TAS5805M_EQ_BANDS; ++band) {
                 int gain = 0;
                 if (tas5805m_settings_load_eq_gain(TAS5805M_EQ_CHANNELS_LEFT, band, &gain) == ESP_OK) {
-                    if (tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain) == ESP_OK) {
-                        ESP_LOGI(TAG, "%s: Applied L band %d = %d (15-band)", __func__, band, gain);
-                    }
+                    tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain);
+                    tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_RIGHT, band, gain);
                 }
             }
         } else if (ui == TAS5805M_EQ_UI_MODE_15_BAND_BIAMP) {
@@ -1224,6 +1224,7 @@ esp_err_t tas5805m_settings_set_from_json(const char *json_in) {
                 tas5805m_set_eq_profile_channel(TAS5805M_EQ_CHANNELS_RIGHT, prof);
             }
         }
+        tas5805m_eq_batch_end();
 #else
         ESP_LOGW(TAG, "%s: EQ support disabled; ignoring eq_ui_mode change", __func__);
 #endif
@@ -2685,18 +2686,16 @@ esp_err_t tas5805m_settings_apply_delayed(void) {
 
     ESP_LOGI(TAG, "%s: Restoring EQ using UI mode %d (%s)", __func__, (int)ui_mode, tas5805m_eq_ui_mode_to_string(ui_mode));
 
+    tas5805m_eq_batch_begin();
     if (ui_mode == TAS5805M_EQ_UI_MODE_OFF) {
         // nothing to restore
     } else if (ui_mode == TAS5805M_EQ_UI_MODE_15_BAND) {
-        // Apply left-channel per-band gains
+        // Apply left-channel per-band gains to both channels
         for (int band = 0; band < TAS5805M_EQ_BANDS; ++band) {
             int gain = 0;
             if (tas5805m_settings_load_eq_gain(TAS5805M_EQ_CHANNELS_LEFT, band, &gain) == ESP_OK) {
-                if (tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain) != ESP_OK) {
-                    ESP_LOGW(TAG, "%s: Failed to apply saved EQ gain L band %d", __func__, band);
-                } else {
-                    ESP_LOGI(TAG, "%s: Restored EQ gain L band %d = %d", __func__, band, gain);
-                }
+                tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain);
+                tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_RIGHT, band, gain);
             }
         }
     } else if (ui_mode == TAS5805M_EQ_UI_MODE_15_BAND_BIAMP) {
@@ -2704,18 +2703,10 @@ esp_err_t tas5805m_settings_apply_delayed(void) {
         for (int band = 0; band < TAS5805M_EQ_BANDS; ++band) {
             int gain = 0;
             if (tas5805m_settings_load_eq_gain(TAS5805M_EQ_CHANNELS_LEFT, band, &gain) == ESP_OK) {
-                if (tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain) != ESP_OK) {
-                    ESP_LOGW(TAG, "%s: Failed to apply saved EQ gain L band %d", __func__, band);
-                } else {
-                    ESP_LOGI(TAG, "%s: Restored EQ gain L band %d = %d", __func__, band, gain);
-                }
+                tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain);
             }
             if (tas5805m_settings_load_eq_gain(TAS5805M_EQ_CHANNELS_RIGHT, band, &gain) == ESP_OK) {
-                if (tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_RIGHT, band, gain) != ESP_OK) {
-                    ESP_LOGW(TAG, "%s: Failed to apply saved EQ gain R band %d", __func__, band);
-                } else {
-                    ESP_LOGI(TAG, "%s: Restored EQ gain R band %d = %d", __func__, band, gain);
-                }
+                tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_RIGHT, band, gain);
             }
         }
     } else if (ui_mode == TAS5805M_EQ_UI_MODE_PRESETS) {
@@ -2752,6 +2743,7 @@ esp_err_t tas5805m_settings_apply_delayed(void) {
             }
         }
     }
+    tas5805m_eq_batch_end();
     
     // Restore channel gain for all EQ modes (not just presets)
     // Channel gain is independent of EQ band settings
@@ -3159,7 +3151,8 @@ esp_err_t tas5805m_settings_set_eq_from_json(const char *json_in) {
         sync_manual_bq = cJSON_IsTrue(sync_flag);
     }
 
-    // Process EQ settings
+    // Process EQ settings with batching (single Hi-Z window to eliminate pop/kribbeln)
+    tas5805m_eq_batch_begin();
     cJSON *item = NULL;
     cJSON_ArrayForEach(item, root) {
         const char *key = item->string;
@@ -3174,7 +3167,7 @@ esp_err_t tas5805m_settings_set_eq_from_json(const char *json_in) {
             if (ui_mode == TAS5805M_EQ_UI_MODE_OFF) {
                 eq_mode = TAS5805M_EQ_MODE_OFF;
             } else if (ui_mode == TAS5805M_EQ_UI_MODE_15_BAND) {
-                // 15-band (left channel only) uses standard EQ mode
+                // 15-band uses standard EQ mode
                 eq_mode = TAS5805M_EQ_MODE_ON;
             } else {
                 // 15-band biamp, presets, and manual all use BIAMP mode
@@ -3185,12 +3178,13 @@ esp_err_t tas5805m_settings_set_eq_from_json(const char *json_in) {
             
             // Apply saved state for the new mode
             if (ui_mode == TAS5805M_EQ_UI_MODE_15_BAND) {
-                // Apply saved per-band gains for left channel
-                ESP_LOGI(TAG, "%s: Applying saved 15-band EQ gains (left channel)", __func__);
+                // Apply saved per-band gains for both channels in 15-band stereo mode
+                ESP_LOGI(TAG, "%s: Applying saved 15-band EQ gains (stereo)", __func__);
                 for (int band = 0; band < TAS5805M_EQ_BANDS; ++band) {
                     int gain = 0;
                     if (tas5805m_settings_load_eq_gain(TAS5805M_EQ_CHANNELS_LEFT, band, &gain) == ESP_OK) {
                         tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain);
+                        tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_RIGHT, band, gain);
                     }
                 }
             } else if (ui_mode == TAS5805M_EQ_UI_MODE_15_BAND_BIAMP) {
@@ -3250,6 +3244,14 @@ esp_err_t tas5805m_settings_set_eq_from_json(const char *json_in) {
                 ESP_LOGI(TAG, "%s: Setting EQ gain left band %d to %d", __func__, band, gain);
                 tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain);
                 tas5805m_settings_save_eq_gain(TAS5805M_EQ_CHANNELS_LEFT, band, gain);
+
+                // If in 15-band stereo mode (not bi-amp), mirror left to right channel!
+                TAS5805M_EQ_UI_MODE cur_ui = TAS5805M_EQ_UI_MODE_OFF;
+                tas5805m_settings_load_eq_ui_mode(&cur_ui);
+                if (cur_ui == TAS5805M_EQ_UI_MODE_15_BAND) {
+                    tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_RIGHT, band, gain);
+                    tas5805m_settings_save_eq_gain(TAS5805M_EQ_CHANNELS_RIGHT, band, gain);
+                }
             }
         }
         else if (strncmp(key, "eq_gain_r_", 10) == 0 && cJSON_IsNumber(item)) {
@@ -3262,6 +3264,7 @@ esp_err_t tas5805m_settings_set_eq_from_json(const char *json_in) {
             }
         }
     }
+    tas5805m_eq_batch_end();
 #endif
 
     cJSON_Delete(root);

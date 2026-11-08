@@ -1547,47 +1547,158 @@ esp_err_t tas5805m_set_eq_gain(int band, int gain) {
   return tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS_LEFT, band, gain);
 }
 
+static int tas5805m_eq_batch_count = 0;
+
+void tas5805m_eq_batch_begin(void)
+{
+  if (tas5805m_eq_batch_count == 0 && tas5805m_hw.is_powered) {
+    bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+    if (was_playing) {
+      TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+      tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
+    }
+  }
+  tas5805m_eq_batch_count++;
+}
+
+void tas5805m_eq_batch_end(void)
+{
+  if (tas5805m_eq_batch_count > 0) {
+    tas5805m_eq_batch_count--;
+    if (tas5805m_eq_batch_count == 0 && tas5805m_hw.is_powered) {
+      bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
+      if (was_playing) {
+        TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+        tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+      }
+    }
+  }
+}
+
+/**
+ * Helper to get the page and offset for a biquad coefficient in Book 0xAA
+ */
+static esp_err_t tas5805m_get_biquad_register(TAS5805M_EQ_CHANNELS channel, int band, 
+                                                int coef_index, uint8_t *page, uint8_t *offset)
+{
+  if (band < 0 || band >= TAS5805M_EQ_BANDS) {
+    ESP_LOGE(TAG, "%s: Invalid band %d", __func__, band);
+    return ESP_ERR_INVALID_ARG;
+  }
+  
+  if (coef_index < 0 || coef_index >= TAS5805M_EQ_KOEF_PER_BAND) {
+    ESP_LOGE(TAG, "%s: Invalid coefficient index %d", __func__, coef_index);
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    if (channel == TAS5805M_EQ_CHANNELS_RIGHT) {
+      if (band == 0) {
+        *page = 0x03;
+        *offset = 0x6C + (coef_index * 4);
+      } else if (band >= 1 && band <= 6) {
+        *page = 0x04;
+        *offset = 0x08 + ((band - 1) * 20) + (coef_index * 4);
+      } else if (band >= 7 && band <= 12) {
+        *page = 0x05;
+        *offset = 0x08 + ((band - 7) * 20) + (coef_index * 4);
+      } else {
+        *page = 0x06;
+        *offset = 0x08 + ((band - 13) * 20) + (coef_index * 4);
+      }
+      return ESP_OK;
+    } else {
+      if (band <= 3) {
+        *page = 0x01;
+        *offset = 0x30 + (band * 20) + (coef_index * 4);
+      } else if (band <= 9) {
+        *page = 0x02;
+        *offset = 0x08 + ((band - 4) * 20) + (coef_index * 4);
+      } else {
+        *page = 0x03;
+        *offset = 0x08 + ((band - 10) * 20) + (coef_index * 4);
+      }
+      return ESP_OK;
+    }
+  }
+
+  // Fallback for TAS5805M
+  const reg_sequence_eq **eq_maps;
+  eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? 
+             tas5805m_eq_registers_right : tas5805m_eq_registers_left;
+  
+  int gain_index = TAS5805M_EQ_MAX_DB; // 0dB
+  int base_index = band * TAS5805M_EQ_KOEF_PER_BAND * TAS5805M_EQ_REG_PER_KOEF;
+  int coef_offset = coef_index * TAS5805M_EQ_REG_PER_KOEF;
+  int reg_index = base_index + coef_offset;
+  
+  const reg_sequence_eq *reg = &eq_maps[gain_index][reg_index];
+  *page = reg->page;
+  *offset = reg->offset;
+  
+  return ESP_OK;
+}
+
 static esp_err_t tas5805m_apply_eq_gain_hw(TAS5805M_EQ_CHANNELS channel, int band, int gain)
 {
-  int current_page = 0;
+  int current_page = -1;
   int ret = ESP_OK;
   int x = gain + TAS5805M_EQ_MAX_DB;
   int y = band * TAS5805M_EQ_KOEF_PER_BAND * TAS5805M_EQ_REG_PER_KOEF;
 
-  const reg_sequence_eq **eq_maps;
   if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
-    eq_maps = tas5825m_eq_registers;
-  } else {
-    eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? tas5805m_eq_registers_right : tas5805m_eq_registers_left;
-  }
+    const reg_sequence_eq *base_seq = &tas5825m_eq_registers[x][y];
+    for (int coef = 0; coef < TAS5805M_EQ_KOEF_PER_BAND; coef++) {
+      uint8_t page = 0, offset = 0;
+      tas5805m_get_biquad_register(channel, band, coef, &page, &offset);
 
-  for (int i = 0; i < TAS5805M_EQ_KOEF_PER_BAND * TAS5805M_EQ_REG_PER_KOEF; i += TAS5805M_EQ_REG_PER_KOEF)
-  {
-      const reg_sequence_eq *reg_value0 = &eq_maps[x][y + i + 0];
-      const reg_sequence_eq *reg_value1 = &eq_maps[x][y + i + 1];
-      const reg_sequence_eq *reg_value2 = &eq_maps[x][y + i + 2];
-      const reg_sequence_eq *reg_value3 = &eq_maps[x][y + i + 3];
-
-      if (reg_value0 == NULL || reg_value1 == NULL || reg_value2 == NULL || reg_value3 == NULL) {
-          ESP_LOGW(TAG, "%s: NULL pointer encountered at row[%d]", __func__, y + i);
-          continue;
+      if (page != current_page) {
+        TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_EQ, page);
+        current_page = page;
       }
 
-      if (reg_value0->page != current_page) {
-        TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_EQ, reg_value0->page);
-        current_page = reg_value0->page;
-      }
+      int i = coef * TAS5805M_EQ_REG_PER_KOEF;
+      uint32_t value = base_seq[i + 0].value |
+                     (base_seq[i + 1].value << 8) |
+                     (base_seq[i + 2].value << 16) |
+                     (base_seq[i + 3].value << 24);
 
-      uint8_t address = reg_value0->offset;
-      uint32_t value = reg_value0->value |
-                     (reg_value1->value << 8) |
-                     (reg_value2->value << 16) |
-                     (reg_value3->value << 24);
-
-      ret = ret | tas5805m_write_bytes(&address, 1, (uint8_t *)&value, sizeof(value));
+      ret |= tas5805m_write_bytes(&offset, 1, (uint8_t *)&value, sizeof(value));
       if (ret != ESP_OK) {
-          ESP_LOGE(TAG, "%s: Error writing to register 0x%x", __func__, address);
+        ESP_LOGE(TAG, "%s: Error writing to register 0x%02x on page 0x%02x", __func__, offset, page);
       }
+    }
+  } else {
+    const reg_sequence_eq **eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? tas5805m_eq_registers_right : tas5805m_eq_registers_left;
+
+    for (int i = 0; i < TAS5805M_EQ_KOEF_PER_BAND * TAS5805M_EQ_REG_PER_KOEF; i += TAS5805M_EQ_REG_PER_KOEF)
+    {
+        const reg_sequence_eq *reg_value0 = &eq_maps[x][y + i + 0];
+        const reg_sequence_eq *reg_value1 = &eq_maps[x][y + i + 1];
+        const reg_sequence_eq *reg_value2 = &eq_maps[x][y + i + 2];
+        const reg_sequence_eq *reg_value3 = &eq_maps[x][y + i + 3];
+
+        if (reg_value0 == NULL || reg_value1 == NULL || reg_value2 == NULL || reg_value3 == NULL) {
+            ESP_LOGW(TAG, "%s: NULL pointer encountered at row[%d]", __func__, y + i);
+            continue;
+        }
+
+        if (reg_value0->page != current_page) {
+          TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_EQ, reg_value0->page);
+          current_page = reg_value0->page;
+        }
+
+        uint8_t address = reg_value0->offset;
+        uint32_t value = reg_value0->value |
+                       (reg_value1->value << 8) |
+                       (reg_value2->value << 16) |
+                       (reg_value3->value << 24);
+
+        ret = ret | tas5805m_write_bytes(&address, 1, (uint8_t *)&value, sizeof(value));
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "%s: Error writing to register 0x%x", __func__, address);
+        }
+    }
   }
 
   TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
@@ -1622,17 +1733,13 @@ esp_err_t tas5805m_set_eq_gain_channel(TAS5805M_EQ_CHANNELS channel, int band, i
     return ESP_OK;
   }
 
-  bool was_playing = (tas5805m_state.state & TAS5805M_CTRL_PLAY) == TAS5805M_CTRL_PLAY;
-  if (was_playing) {
-    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
-    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, TAS5805M_CTRL_HI_Z);
-  }
-
-  int ret = tas5805m_apply_eq_gain_hw(channel, band, gain);
-
-  if (was_playing) {
-    TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
-    tas5805m_write_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, tas5805m_state.state);
+  int ret = ESP_OK;
+  if (tas5805m_eq_batch_count == 0) {
+    tas5805m_eq_batch_begin();
+    ret = tas5805m_apply_eq_gain_hw(channel, band, gain);
+    tas5805m_eq_batch_end();
+  } else {
+    ret = tas5805m_apply_eq_gain_hw(channel, band, gain);
   }
 
   return ret;
@@ -1730,56 +1837,6 @@ esp_err_t tas5805m_set_eq_profile_channel(TAS5805M_EQ_CHANNELS channel, TAS5805M
 /* -------------------------
    Biquad coefficient access
    ------------------------- */
-
-/**
- * @brief Get the register offset for a specific biquad coefficient.
- * 
- * Each band has 5 coefficients (B0, B1, B2, A1, A2) stored sequentially.
- * Each coefficient is 4 bytes in Q5.27 format.
- * 
- * @param channel Left or right channel
- * @param band Band index (0-14)
- * @param coef_index Coefficient index (0=B0, 1=B1, 2=B2, 3=A1, 4=A2)
- * @param page Output: page number
- * @param offset Output: register offset
- * @return ESP_OK on success
- */
-static esp_err_t tas5805m_get_biquad_register(TAS5805M_EQ_CHANNELS channel, int band, 
-                                                int coef_index, uint8_t *page, uint8_t *offset)
-{
-  if (band < 0 || band >= TAS5805M_EQ_BANDS) {
-    ESP_LOGE(TAG, "%s: Invalid band %d", __func__, band);
-    return ESP_ERR_INVALID_ARG;
-  }
-  
-  if (coef_index < 0 || coef_index >= TAS5805M_EQ_KOEF_PER_BAND) {
-    ESP_LOGE(TAG, "%s: Invalid coefficient index %d", __func__, coef_index);
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  // Calculate position in the register map
-  // We need to look at the data tables to find the pattern
-  // From tas5805m_set_eq_gain_channel: gain 0dB is at index TAS5805M_EQ_MAX_DB
-  const reg_sequence_eq **eq_maps;
-  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
-    eq_maps = tas5825m_eq_registers;
-  } else {
-    eq_maps = (channel == TAS5805M_EQ_CHANNELS_RIGHT) ? 
-               tas5805m_eq_registers_right : tas5805m_eq_registers_left;
-  }
-  
-  // Use 0dB gain (middle of the range) as reference for current coefficient positions
-  int gain_index = TAS5805M_EQ_MAX_DB; // 0dB
-  int base_index = band * TAS5805M_EQ_KOEF_PER_BAND * TAS5805M_EQ_REG_PER_KOEF;
-  int coef_offset = coef_index * TAS5805M_EQ_REG_PER_KOEF;
-  int reg_index = base_index + coef_offset;
-  
-  const reg_sequence_eq *reg = &eq_maps[gain_index][reg_index];
-  *page = reg->page;
-  *offset = reg->offset;
-  
-  return ESP_OK;
-}
 
 esp_err_t tas5805m_read_biquad_coefficients(TAS5805M_EQ_CHANNELS channel, int band, 
                                               float *b0, float *b1, float *b2, 
