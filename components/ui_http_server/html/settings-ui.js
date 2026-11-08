@@ -137,7 +137,7 @@
   }
 
   // Vertical slider renderer for EQ band display
-  function renderVerticalSlider(param, currentSettings, onChange) {
+  function renderVerticalSlider(param, currentSettings, onChange, onInput) {
     const sliderDiv = document.createElement('div');
     sliderDiv.className = 'eq-band-slider';
 
@@ -158,6 +158,7 @@
     slider.value = value;
     slider.oninput = function () {
       valueDisplay.textContent = `${this.value}${param.unit || ''}`;
+      if (onInput) onInput(param.key, parseInt(this.value));
     };
     slider.onchange = function () {
       if (onChange) onChange(param.key, parseInt(this.value));

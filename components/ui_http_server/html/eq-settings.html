@@ -377,6 +377,77 @@
       margin-bottom: 5px;
     }
 
+    /* EQ Presets Bar */
+    .presets-bar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 20px;
+      padding: 12px 16px;
+      background: #f8f9fa;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+    }
+
+    .presets-label {
+      font-size: 13px;
+      font-weight: bold;
+      color: #495057;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .presets-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      flex: 1;
+    }
+
+    .preset-btn {
+      padding: 6px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      border: 1px solid #cbd5e1;
+      border-radius: 20px;
+      background-color: white;
+      color: #334155;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      outline: none;
+    }
+
+    .preset-btn:hover {
+      background-color: #e2e8f0;
+      border-color: #94a3b8;
+      color: #0f172a;
+    }
+
+    .preset-btn.active {
+      background-color: #007bff;
+      border-color: #0056b3;
+      color: white;
+      box-shadow: 0 2px 8px rgba(0, 123, 255, 0.4);
+    }
+
+    .preset-status-badge {
+      font-size: 12px;
+      font-weight: 600;
+      padding: 5px 12px;
+      border-radius: 12px;
+      background: #e2e8f0;
+      color: #64748b;
+      white-space: nowrap;
+      transition: all 0.2s ease;
+    }
+
+    .preset-status-badge.active-preset {
+      background: #dbeafe;
+      color: #1d4ed8;
+      border: 1px solid #bfdbfe;
+    }
+
     .button-group {
       display: flex;
       gap: 10px;
@@ -399,6 +470,146 @@
 
     let currentSettings = {};
     let schema = {};
+
+    const EQ_PRESETS = {
+      "Flat (Linear)":           [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "Warm & Dynamic":          [4, 4, 3, 2, 1, 0, 0, 0, 0, 1, 1, 2, 2, 3, 3],
+      "Bass Boost":              [6, 5, 4, 3, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+      "Vocal & Dialogue":        [-2, -2, -1, 0, 0, 1, 2, 3, 3, 2, 1, 0, 0, -1, -2],
+      "Treble Crisp":            [-1, -1, 0, 0, 0, 0, 0, 0, 1, 1, 2, 3, 4, 5, 5],
+      "Loudness":                [5, 4, 3, 1, 0, -1, -1, 0, 0, 1, 2, 3, 4, 4, 5]
+    };
+
+    function renderPresetBar(channel) {
+      const bar = document.createElement('div');
+      bar.className = 'presets-bar';
+      bar.setAttribute('data-preset-bar-channel', channel);
+
+      const label = document.createElement('span');
+      label.className = 'presets-label';
+      label.textContent = 'Presets:';
+      bar.appendChild(label);
+
+      const buttonsContainer = document.createElement('div');
+      buttonsContainer.className = 'presets-buttons';
+
+      Object.keys(EQ_PRESETS).forEach(presetName => {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'preset-btn';
+        btn.textContent = presetName;
+        btn.setAttribute('data-preset-name', presetName);
+        btn.onclick = async (e) => {
+          e.preventDefault();
+          await applyPreset(presetName, channel);
+        };
+        buttonsContainer.appendChild(btn);
+      });
+      bar.appendChild(buttonsContainer);
+
+      const badge = document.createElement('div');
+      badge.className = 'preset-status-badge';
+      badge.setAttribute('data-preset-badge-channel', channel);
+      badge.textContent = 'Individuell';
+      bar.appendChild(badge);
+
+      return bar;
+    }
+
+    function updatePresetActiveState(channel) {
+      const prefix = (channel === 'right') ? 'eq_gain_r_' : 'eq_gain_l_';
+      let activePreset = null;
+
+      for (const [name, curve] of Object.entries(EQ_PRESETS)) {
+        let match = true;
+        for (let band = 0; band < 15; band++) {
+          const key = `${prefix}${band}`;
+          const val = (currentSettings[key] !== undefined) ? Number(currentSettings[key]) : 0;
+          if (val !== curve[band]) {
+            match = false;
+            break;
+          }
+        }
+        if (match) {
+          activePreset = name;
+          break;
+        }
+      }
+
+      const bar = document.querySelector(`.presets-bar[data-preset-bar-channel="${channel}"]`);
+      if (!bar) return;
+
+      const buttons = bar.querySelectorAll('.preset-btn');
+      buttons.forEach(btn => {
+        const name = btn.getAttribute('data-preset-name');
+        if (activePreset && name === activePreset) {
+          btn.classList.add('active');
+        } else {
+          btn.classList.remove('active');
+        }
+      });
+
+      const badge = bar.querySelector(`.preset-status-badge[data-preset-badge-channel="${channel}"]`);
+      if (badge) {
+        if (activePreset) {
+          badge.textContent = `Aktiv: ${activePreset}`;
+          badge.classList.add('active-preset');
+        } else {
+          badge.textContent = 'Individuell (Custom)';
+          badge.classList.remove('active-preset');
+        }
+      }
+    }
+
+    function updateSlidersInDOM(channel, curve) {
+      const container = document.querySelector(`.eq-bands-container[data-channel="${channel}"]`);
+      if (!container) return;
+
+      const sliders = container.querySelectorAll('.eq-band-slider');
+      sliders.forEach((sliderDiv, band) => {
+        if (band < curve.length) {
+          const input = sliderDiv.querySelector('input[type="range"]');
+          const valDisplay = sliderDiv.querySelector('.value-display');
+          if (input) input.value = curve[band];
+          if (valDisplay) valDisplay.textContent = `${curve[band]}dB`;
+        }
+      });
+    }
+
+    async function applyPreset(presetName, channel) {
+      const curve = EQ_PRESETS[presetName];
+      if (!curve) return;
+
+      const prefix = (channel === 'right') ? 'eq_gain_r_' : 'eq_gain_l_';
+      const update = {};
+
+      for (let i = 0; i < 15; i++) {
+        const key = `${prefix}${i}`;
+        update[key] = curve[i];
+        currentSettings[key] = curve[i];
+      }
+
+      let modeChanged = false;
+      if (currentSettings.eq_ui_mode === 0) {
+        update.eq_ui_mode = 1;
+        currentSettings.eq_ui_mode = 1;
+        modeChanged = true;
+      }
+
+      updateSlidersInDOM(channel, curve);
+      updatePresetActiveState(channel);
+
+      try {
+        console.log(`Applying preset "${presetName}" to channel ${channel}`);
+        await postRequest('/api/eq/settings', update);
+        if (modeChanged) {
+          await loadSettings();
+        }
+      } catch (error) {
+        console.error('Error applying preset:', error);
+        alert(`Fehler beim Anwenden des Presets: ${error.message}`);
+      }
+    }
 
     // Get backend URL from query parameter or default to current origin
     function getBackendUrl() {
@@ -502,17 +713,36 @@
 
       // Handle EQ bands layout (vertical sliders)
       if (group.layout === 'eq-bands' && group.parameters) {
+        const channel = group.channel || 'left';
+
+        // Add 1-click sound presets bar
+        const presetBar = renderPresetBar(channel);
+        contentWrapper.appendChild(presetBar);
+
         const bandsContainer = document.createElement('div');
         bandsContainer.className = 'eq-bands-container';
+        bandsContainer.setAttribute('data-channel', channel);
         
         group.parameters.forEach(param => {
-          const sliderDiv = settingsUI.renderVerticalSlider(param, currentSettings, async (k, v) => { await updateSetting(k, v); });
+          const sliderDiv = settingsUI.renderVerticalSlider(
+            param,
+            currentSettings,
+            async (k, v) => {
+              await updateSetting(k, v);
+              updatePresetActiveState(channel);
+            },
+            (k, v) => {
+              currentSettings[k] = v;
+              updatePresetActiveState(channel);
+            }
+          );
           bandsContainer.appendChild(sliderDiv);
         });
         
         contentWrapper.appendChild(bandsContainer);
         groupDiv.appendChild(contentWrapper);
         updateGroupVisibility(groupDiv);
+        updatePresetActiveState(channel);
         return groupDiv;
       }
 
