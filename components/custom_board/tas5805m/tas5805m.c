@@ -700,16 +700,13 @@ static esp_err_t tas5805m_refresh(void) {
   tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, tas5805m_hw.raw_vol);
   /* Configure soft volume ramp rate in DIG_VOL_CTRL2 (0x4E): 0x11 = 0.5 dB / 2 samples ramp (matches Linux tas58xx.c) */
   tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x11);
-  /* Configure hardware auto-mute on silence with max delay: 5.33s in 0x51 (0x77)
-   * With LSB dither active in the I2S stream, mid-song quiet passages never trigger auto-mute,
-   * while idle periods and host crashes safely mute the power stage after 5.33 seconds.
-   */
-  tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x07);
-  tas5805m_write_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, 0x77);
+  /* Disable hardware auto-mute on silence (0x50): prevents clicks/pops during fade-outs and quiet song passages (matches Linux tas58xx.c:431) */
+  tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x00);
+  tas5805m_write_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, 0xFF);
   uint8_t am_val = 0xFF;
   tas5805m_read_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, &am_val);
-  ESP_LOGI(TAG, "%s: Hardware Auto-Mute (0x50): written 0x07, verified readback 0x%02X (time=5.33s)",
-           __func__, am_val);
+  ESP_LOGI(TAG, "%s: Hardware Auto-Mute (0x50): written 0x00, verified readback 0x%02X (%s)",
+           __func__, am_val, am_val == 0x00 ? "DISABLED (matches Linux driver)" : "ENABLED");
   uint8_t again_idx = tas5805m_hw.again;
   if (again_idx > TAS5805M_MIN_GAIN) again_idx = TAS5805M_MIN_GAIN;
   tas5805m_write_byte(TAS5805M_AGAIN_REGISTER, tas5805m_again[again_idx]);
@@ -731,20 +728,21 @@ static esp_err_t tas5805m_refresh(void) {
     tas5805m_write_byte(TAS5805M_ANA_CTRL_REGISTER, current_ana);
   }
 
-  /* Step 6: Configure EQ mode / gang / bypass */
+  /* Step 6: Configure EQ mode / gang / bypass
+   * Matches Linux driver (tas58xx.c:481-502):
+   * For TAS5830M, DSP_CTRL (0x46) bit 0 (DEF_COEF) controls whether the DSP loads
+   * default flat coefficients from internal ZROM (DEF_COEF=1, EQ bypassed/flat)
+   * or uses host-written coefficient RAM in Book 0xAA (DEF_COEF=0, EQ active).
+   */
 #if defined(CONFIG_DAC_TAS5805M_EQ_SUPPORT)
   if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
     bool eq_enable = (tas5805m_hw.eq_mode != TAS5805M_EQ_MODE_OFF &&
                       tas5805m_hw.eq_mode != TAS5805M_EQ_MODE_BIAMP_OFF);
-    TAS5805M_SET_BOOK_AND_PAGE(TAS5825M_REG_BOOK_5, TAS5825M_REG_BOOK_5_PAGE);
-    uint8_t gang_reg = TAS5825M_REG_EQ_GANG_ENABLE;
-    uint8_t gang_val[4] = {0x00, 0x00, 0x00, 0x01};
-    tas5805m_write_bytes(&gang_reg, 1, gang_val, 4);
-
-    uint8_t bypass_reg = TAS5825M_REG_EQ_BYPASS_ENABLE;
-    uint8_t bypass_val[4] = {0x00, 0x00, 0x00, eq_enable ? 0x00 : 0x01};
-    tas5805m_write_bytes(&bypass_reg, 1, bypass_val, 4);
     TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    tas5805m_write_byte(TAS5805M_DSP_CTRL_REGISTER, eq_enable ? 0x00 : 0x01);
+    ESP_LOGI(TAG, "%s: TAS5830M DSP_CTRL (0x46) set to 0x%02X (DEF_COEF=%d, %s)",
+             __func__, eq_enable ? 0x00 : 0x01, eq_enable ? 0 : 1,
+             eq_enable ? "Host RAM EQ Active" : "ZROM Flat/Bypass");
   } else {
     tas5805m_write_byte(TAS5805M_DSP_MISC_REGISTER, (uint8_t)tas5805m_hw.eq_mode);
   }
@@ -753,19 +751,28 @@ static esp_err_t tas5805m_refresh(void) {
   /* Step 7: Write 4-channel Mixer Matrix in Book 0x8C */
   tas5805m_apply_mixer_mode_hw(tas5805m_state.mixer_mode);
 
-  /* Step 8: Write Left and Right Channel Volumes in Book 0x8C */
-  tas5805m_apply_channel_gain_hw(TAS5805M_EQ_CHANNELS_LEFT, tas5805m_state.channel_gain_l);
-  tas5805m_apply_channel_gain_hw(TAS5805M_EQ_CHANNELS_RIGHT, tas5805m_state.channel_gain_r);
+  /* Step 8: Write Left and Right Channel Volumes in Book 0x8C (TAS5805M only)
+   * On TAS5830M in ROM process flow (without PurePath .cfg), per-channel volume
+   * registers do not exist in DSP RAM (matches Linux tas58xx.c:560 & 2320).
+   */
+  if (tas5805m_chip_variant != TAS58XX_CHIP_TAS5830M) {
+    tas5805m_apply_channel_gain_hw(TAS5805M_EQ_CHANNELS_LEFT, tas5805m_state.channel_gain_l);
+    tas5805m_apply_channel_gain_hw(TAS5805M_EQ_CHANNELS_RIGHT, tas5805m_state.channel_gain_r);
+  }
 
   /* Step 9: Write EQ Biquad Coefficients in Book 0xAA */
 #if defined(CONFIG_DAC_TAS5805M_EQ_SUPPORT)
   if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
-    /* On TAS5830M with Gang EQ enabled (0x28 = 1), left channel table drives both channels */
-    if (tas5805m_hw.use_eq_profile[TAS5805M_EQ_CHANNELS_LEFT]) {
-      tas5805m_apply_eq_profile_hw(TAS5805M_EQ_CHANNELS_LEFT, tas5805m_state.eq_profile[TAS5805M_EQ_CHANNELS_LEFT]);
-    } else {
-      for (int band = 0; band < TAS5805M_EQ_BANDS; band++) {
-        tas5805m_apply_eq_gain_hw(TAS5805M_EQ_CHANNELS_LEFT, band, tas5805m_state.eq_gain_l[band]);
+    bool eq_enable = (tas5805m_hw.eq_mode != TAS5805M_EQ_MODE_OFF &&
+                      tas5805m_hw.eq_mode != TAS5805M_EQ_MODE_BIAMP_OFF);
+    if (eq_enable) {
+      /* On TAS5830M with DEF_COEF=0, write 15-band biquads to Book 0xAA (matches Linux tas58xx.c:578-598) */
+      if (tas5805m_hw.use_eq_profile[TAS5805M_EQ_CHANNELS_LEFT]) {
+        tas5805m_apply_eq_profile_hw(TAS5805M_EQ_CHANNELS_LEFT, tas5805m_state.eq_profile[TAS5805M_EQ_CHANNELS_LEFT]);
+      } else {
+        for (int band = 0; band < TAS5805M_EQ_BANDS; band++) {
+          tas5805m_apply_eq_gain_hw(TAS5805M_EQ_CHANNELS_LEFT, band, tas5805m_state.eq_gain_l[band]);
+        }
       }
     }
   } else {
@@ -846,12 +853,11 @@ esp_err_t tas5805m_ctrl(audio_hal_codec_mode_t mode,
     } else {
       ESP_LOGI(TAG, "%s: Warm resume (DSP already booted) - releasing soft-mute", __func__);
       TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
-      tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x07);
-      tas5805m_write_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, 0x77);
+      tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x00);
       uint8_t am_val = 0xFF;
       tas5805m_read_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, &am_val);
-      ESP_LOGI(TAG, "%s: Warm resume Auto-Mute (0x50) verified: 0x%02X (time=5.33s)",
-               __func__, am_val);
+      ESP_LOGI(TAG, "%s: Warm resume Auto-Mute (0x50) verified: 0x%02X (%s)",
+               __func__, am_val, am_val == 0x00 ? "DISABLED" : "ENABLED");
     }
 
     /* Enter PLAY + MUTE (0x0B), wait for clock lock, then unmute to PLAY (0x03) */
@@ -1245,6 +1251,11 @@ esp_err_t tas5805m_set_mixer_gain(TAS5805M_MIXER_CHANNELS channel, uint32_t gain
 
 static esp_err_t tas5805m_apply_channel_gain_hw(TAS5805M_EQ_CHANNELS channel, int8_t gain_db)
 {
+  if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
+    /* Per-channel volume registers do not exist in ROM process flow on TAS5830M (matches Linux tas58xx.c:560 & 2320) */
+    return ESP_OK;
+  }
+
   /* Convert dB to linear gain and then to Q9.23 register format */
   float linear = powf(10.0f, ((float)gain_db) / 20.0f);
   uint32_t reg_value = tas5805m_float_to_q9_23(linear);
@@ -1435,18 +1446,16 @@ esp_err_t tas5805m_get_eq_mode(TAS5805M_EQ_MODE *mode)
   }
 
   if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
-    TAS5805M_SET_BOOK_AND_PAGE(TAS5825M_REG_BOOK_5, TAS5825M_REG_BOOK_5_PAGE);
-    uint8_t bypass_reg = TAS5825M_REG_EQ_BYPASS_ENABLE;
-    uint8_t bypass_val[4] = {0};
-    esp_err_t err = tas5805m_read_bytes(&bypass_reg, 1, bypass_val, 4);
     TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    uint8_t dsp_ctrl = 0;
+    esp_err_t err = tas5805m_read_byte(TAS5805M_DSP_CTRL_REGISTER, &dsp_ctrl);
     if (err != ESP_OK) {
-      ESP_LOGE(TAG, "%s: Error reading EQ bypass register: %s", __func__, esp_err_to_name(err));
+      ESP_LOGE(TAG, "%s: Error reading DSP_CTRL register: %s", __func__, esp_err_to_name(err));
       *mode = tas5805m_hw.eq_mode;
       return err;
     }
-    // bypass_val[3] == 0 means EQ is enabled (not bypassed)
-    *mode = (bypass_val[3] == 0) ? TAS5805M_EQ_MODE_ON : TAS5805M_EQ_MODE_OFF;
+    /* DEF_COEF (bit 0): 0 = Host coefficient RAM (EQ On), 1 = ZROM default flat coefficients (EQ Off) */
+    *mode = (dsp_ctrl & 0x01) ? TAS5805M_EQ_MODE_OFF : TAS5805M_EQ_MODE_ON;
     return ESP_OK;
   } else {
     TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
@@ -1482,15 +1491,8 @@ esp_err_t tas5805m_set_eq(bool enable)
 
   esp_err_t ret = ESP_OK;
   if (tas5805m_chip_variant == TAS58XX_CHIP_TAS5830M) {
-    TAS5805M_SET_BOOK_AND_PAGE(TAS5825M_REG_BOOK_5, TAS5825M_REG_BOOK_5_PAGE);
-    uint8_t gang_reg = TAS5825M_REG_EQ_GANG_ENABLE;
-    uint8_t gang_val[4] = {0x00, 0x00, 0x00, 0x01};
-    tas5805m_write_bytes(&gang_reg, 1, gang_val, 4);
-
-    uint8_t bypass_reg = TAS5825M_REG_EQ_BYPASS_ENABLE;
-    uint8_t bypass_val[4] = {0x00, 0x00, 0x00, enable ? 0x00 : 0x01};
-    ret = tas5805m_write_bytes(&bypass_reg, 1, bypass_val, 4);
     TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
+    ret = tas5805m_write_byte(TAS5805M_DSP_CTRL_REGISTER, enable ? 0x00 : 0x01);
   } else {
     TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
     ret = tas5805m_write_byte(TAS5805M_DSP_MISC_REGISTER, enable ? TAS5805M_CTRL_EQ_ON : TAS5805M_CTRL_EQ_OFF);
@@ -1955,11 +1957,13 @@ esp_err_t tas5805m_dump_registers(char *buf, size_t buf_len)
   uint8_t sap1 = 0, sap2 = 0, sap3 = 0;
   uint8_t f_chan = 0, f_glob1 = 0, f_glob2 = 0, f_warn = 0;
   uint8_t vol_ctrl2 = 0, vol_ctrl3 = 0, am_ctrl = 0, am_time = 0, am_state = 0;
+  uint8_t dsp_ctrl = 0;
 
   tas5805m_read_byte(TAS5805M_DIE_ID_REGISTER, &die_id);
   tas5805m_read_byte(0x68, &die_ver);
   tas5805m_read_byte(TAS5805M_DEVICE_CTRL_1_REGISTER, &ctrl1);
   tas5805m_read_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, &ctrl2);
+  tas5805m_read_byte(TAS5805M_DSP_CTRL_REGISTER, &dsp_ctrl);
   tas5805m_read_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, &vol);
   tas5805m_read_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, &vol_ctrl2);
   tas5805m_read_byte(TAS5805M_DIG_VOL_CTRL3_REGISTER, &vol_ctrl3);
@@ -1995,6 +1999,7 @@ esp_err_t tas5805m_dump_registers(char *buf, size_t buf_len)
   DUMP_PRINT("  0x24 SAP_CTRL_1:    0x%02X\n", sap1);
   DUMP_PRINT("  0x25 SAP_CTRL_2:    0x%02X\n", sap2);
   DUMP_PRINT("  0x26 SAP_CTRL_3:    0x%02X\n", sap3);
+  DUMP_PRINT("  0x46 DSP_CTRL:      0x%02X  [DEF_COEF=%d (%s)]\n", dsp_ctrl, dsp_ctrl & 1, (dsp_ctrl & 1) ? "ZROM Flat/Bypass" : "Host RAM EQ Active");
   DUMP_PRINT("  0x4C DIG_VOL_CTRL:  0x%02X  (%.1f dB)\n", vol, (vol <= 0x30) ? (0x30 - vol) * 0.5f : -(vol - 0x30) * 0.5f);
   DUMP_PRINT("  0x4E DIG_VOL_CTRL2: 0x%02X\n", vol_ctrl2);
   DUMP_PRINT("  0x4F DIG_VOL_CTRL3: 0x%02X\n", vol_ctrl3);
