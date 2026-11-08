@@ -55,8 +55,8 @@ esp_pm_lock_handle_t player_pm_lock_handle = NULL;
 #define INSERT_SAMPLES \
   1  //!< currently only allowed to be 1 or sync algorithm will break
 
-const uint32_t SHORT_OFFSET = 1000;
-const uint32_t MINI_OFFSET = 500;
+const uint32_t SHORT_OFFSET = 15000;
+const uint32_t MINI_OFFSET = 10000;
 
 #else
 const uint32_t SHORT_OFFSET = 2;
@@ -1799,6 +1799,8 @@ static void player_task(void *pvParameters) {
 
           my_gptimer_stop(gptimer);
           
+          int64_t dac_init_start = esp_timer_get_time();
+
           /* Enable I2S clock BEFORE enabling DAC so TAS58xx DSP boots with active BCLK/LRCLK */
           my_i2s_channel_enable(tx_chan);
           
@@ -1819,8 +1821,14 @@ static void player_task(void *pvParameters) {
           vTaskDelay(pdMS_TO_TICKS(2));
           audio_set_mute(scSet.muted);
 
-          ESP_LOGI(TAG, "initial sync age: %lldus, chunk duration: %lldus", age,
-                   chunkDuration_us);
+          /* Compensate chunkStart by the time elapsed during DAC boot / I2C register writes
+           * so shortMedian starts perfectly aligned at ~0 µs, eliminating initial burst of sample drops.
+           */
+          int64_t dac_init_time = esp_timer_get_time() - dac_init_start;
+          chunkStart += dac_init_time;
+
+          ESP_LOGI(TAG, "initial sync age: %lldus, chunk duration: %lldus, dac_init_time: %lldus", age,
+                   chunkDuration_us, dac_init_time);
 
           if (size == 0) {
             continue;
@@ -1879,7 +1887,7 @@ static void player_task(void *pvParameters) {
 
       const int64_t shortOffset = SHORT_OFFSET;  // µs, softsync
       const int64_t miniOffset = MINI_OFFSET;    // µs, softsync
-      const int64_t hardResyncThreshold = 25000; // µs, hard sync (~1 chunk margin)
+      const int64_t hardResyncThreshold = 35000; // µs, hard sync (~1 chunk margin)
 
       if (initialSync == 1) {
         if (size == 0) {
@@ -1896,7 +1904,29 @@ static void player_task(void *pvParameters) {
               uint32_t sampleSizeInBytes =
                   framesToBytes * INSERT_SAMPLES;
   
-              if ((dir_insert_sample > 0) && (size >= sampleSizeInBytes)) {
+              if ((dir_insert_sample > 0) && (size >= sampleSizeInBytes * 2)) {
+                /* Drop 1 frame at zero-crossing / lowest amplitude to eliminate audible clicks */
+                size_t total_frames = size / framesToBytes;
+                const int16_t *s = (const int16_t *)p_payload;
+                size_t best_f = total_frames - 1;
+                int32_t min_amp = INT32_MAX;
+                for (size_t f = 0; f < total_frames; f++) {
+                  int32_t amp = abs((int32_t)s[f * 2]) + abs((int32_t)s[f * 2 + 1]);
+                  if (amp < min_amp) {
+                    min_amp = amp;
+                    best_f = f;
+                    if (amp == 0) break;
+                  }
+                }
+                if (best_f < total_frames - 1) {
+                  int16_t *dest = (int16_t *)p_payload + best_f * 2;
+                  const int16_t *src = dest + 2;
+                  size_t bytes_to_move = (total_frames - best_f - 1) * framesToBytes;
+                  memmove(dest, src, bytes_to_move);
+                }
+                size -= sampleSizeInBytes;
+                dir_insert_sample = 0;
+              } else if ((dir_insert_sample > 0) && (size >= sampleSizeInBytes)) {
                 size -= sampleSizeInBytes;
                 dir_insert_sample = 0;
               }
@@ -2144,13 +2174,19 @@ static void player_task(void *pvParameters) {
           }
 
 #if USE_SAMPLE_INSERTION  // insert samples to adjust sync
+          static uint32_t last_sample_adjust_chunk = 0;
+          static uint32_t current_chunk_counter = 0;
+          current_chunk_counter++;
+
           if ((enableControlLoop == true) &&
-              (MEDIANFILTER_isFull(&shortMedianFilter, 0))) {
+              (MEDIANFILTER_isFull(&shortMedianFilter, 0)) &&
+              (current_chunk_counter - last_sample_adjust_chunk >= 40)) {
             if ((shortMedian < -shortOffset) && (miniMedian < -miniOffset) &&
                 (age < -miniOffset)) {  // we are early
               dir = -1;
               dir_insert_sample = -1;
               insertedSamplesCounter += INSERT_SAMPLES;
+              last_sample_adjust_chunk = current_chunk_counter;
               ESP_LOGI(TAG, "Sync adjust: inserting %d sample(s) (shortMedian=%lld, age=%lld)",
                        INSERT_SAMPLES, shortMedian, age);
             } else if ((shortMedian > shortOffset) &&
@@ -2159,6 +2195,7 @@ static void player_task(void *pvParameters) {
               dir = 1;
               dir_insert_sample = 1;
               insertedSamplesCounter -= INSERT_SAMPLES;
+              last_sample_adjust_chunk = current_chunk_counter;
               ESP_LOGI(TAG, "Sync adjust: dropping %d sample(s) (shortMedian=%lld, age=%lld)",
                        INSERT_SAMPLES, shortMedian, age);
             }
