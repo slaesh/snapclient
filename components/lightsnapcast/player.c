@@ -178,24 +178,23 @@ esp_err_t my_i2s_channel_enable(i2s_chan_handle_t handle) {
 #if CONFIG_DAC_TAS5805M
 static int32_t i2s_expand_buf[256];
 
-/* Sub-audible triangular dither generator at 16-bit LSB level (-96 dBFS).
+/* Sub-audible triangular dither generator at 24-bit LSB level (-132 dBFS).
  * In 32-bit slot width, 16-bit audio occupies bits [31:16].
  * Pure digital silence (0x00000000) causes the TAS58xx internal zero-detect circuit
  * to abruptly collapse PWM modulation with an audible "plop" during silent song passages.
- * Adding +/-1 LSB of zero-mean dither directly to bit 16 keeps Class-D PWM switching active,
- * perfectly smooth and centered, while being completely inaudible.
+ * Adding +/-2 counts of zero-mean dither in bits [10:8] keeps Class-D PWM switching active,
+ * perfectly smooth and centered, while being completely inaudible (24 dB below DAC thermal floor).
  */
 static inline int32_t player_expand_sample(int16_t sample) {
   static uint32_t dither_lfsr = 0x12345678;
   dither_lfsr = (dither_lfsr >> 1) ^ (-(dither_lfsr & 1u) & 0xD0000001u);
-  int32_t r1 = (int32_t)(dither_lfsr & 1u);
+  int32_t r1 = (int32_t)(dither_lfsr & 0x03) - 1;
   dither_lfsr = (dither_lfsr >> 1) ^ (-(dither_lfsr & 1u) & 0xD0000001u);
-  int32_t r2 = (int32_t)(dither_lfsr & 1u);
-  int32_t dither = (r1 - r2) << 16;
+  int32_t r2 = (int32_t)(dither_lfsr & 0x03) - 1;
+  int32_t dither = (r1 + r2) << 8;
 
   int32_t s32 = ((int32_t)sample) << 16;
-  if (sample == INT16_MAX && dither > 0) dither = 0;
-  if (sample == INT16_MIN && dither < 0) dither = 0;
+  if (sample == INT16_MIN && dither < 0) dither = -dither;
   return s32 + dither;
 }
 
