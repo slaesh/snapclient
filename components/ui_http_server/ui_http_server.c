@@ -23,6 +23,8 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "settings_manager.h"
+#include "player.h"
+#include "cJSON.h"
 
 #if CONFIG_DAC_TAS5805M
 #include "tas5805m_settings.h"
@@ -820,6 +822,64 @@ static esp_err_t post_dac_settings_handler(httpd_req_t *req) {
 }
 
 /*
+ * POST /api/dac/beep handler
+ * Plays a test beep tone (880 Hz sine wave) on left, right, or both channels
+ */
+static esp_err_t post_dac_beep_handler(httpd_req_t *req) {
+  ESP_LOGD(TAG, "%s: uri=%s", __func__, req->uri);
+  set_cors_headers(req);
+
+  int channel = 0; // 0=both/mono, 1=left, 2=right
+  int duration_ms = 1000;
+
+  if (req->content_len > 0) {
+    char *buf = (char *)malloc(req->content_len + 1);
+    if (buf) {
+      int ret = httpd_req_recv(req, buf, req->content_len);
+      if (ret > 0) {
+        buf[ret] = '\0';
+        cJSON *root = cJSON_Parse(buf);
+        if (root) {
+          cJSON *ch_item = cJSON_GetObjectItem(root, "channel");
+          if (ch_item) {
+            if (cJSON_IsNumber(ch_item)) {
+              channel = ch_item->valueint;
+            } else if (cJSON_IsString(ch_item)) {
+              if (strcasecmp(ch_item->valuestring, "left") == 0 || strcasecmp(ch_item->valuestring, "l") == 0) {
+                channel = 1;
+              } else if (strcasecmp(ch_item->valuestring, "right") == 0 || strcasecmp(ch_item->valuestring, "r") == 0) {
+                channel = 2;
+              } else {
+                channel = 0;
+              }
+            }
+          }
+          cJSON *dur_item = cJSON_GetObjectItem(root, "duration_ms");
+          if (dur_item && cJSON_IsNumber(dur_item) && dur_item->valueint > 0) {
+            duration_ms = dur_item->valueint;
+          }
+          cJSON_Delete(root);
+        }
+      }
+      free(buf);
+    }
+  }
+
+  esp_err_t err = player_trigger_beep(channel, duration_ms);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "%s: player_trigger_beep returned %s", __func__, esp_err_to_name(err));
+    httpd_resp_set_status(req, "500 Internal Server Error");
+    httpd_resp_sendstr(req, "{\"error\": \"Failed to trigger beep\"}");
+    return ESP_OK;
+  }
+
+  httpd_resp_set_status(req, "200 OK");
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_sendstr(req, "{\"success\": true}");
+  return ESP_OK;
+}
+
+/*
  * GET /api/eq/settings handler
  * Returns current TAS5805M EQ settings as JSON
  */
@@ -1191,6 +1251,21 @@ esp_err_t start_server(const char *base_path, int port) {
 		.handler = options_handler,
 	};
 	httpd_register_uri_handler(server, &_options_dac_registers_handler);
+
+	/* URI handlers for Beep test tone API */
+	httpd_uri_t _post_dac_beep_handler = {
+		.uri = "/api/dac/beep",
+		.method = HTTP_POST,
+		.handler = post_dac_beep_handler,
+	};
+	httpd_register_uri_handler(server, &_post_dac_beep_handler);
+
+	httpd_uri_t _options_dac_beep_handler = {
+		.uri = "/api/dac/beep",
+		.method = HTTP_OPTIONS,
+		.handler = options_handler,
+	};
+	httpd_register_uri_handler(server, &_options_dac_beep_handler);
 
 	/* URI handlers for EQ settings API */
 	httpd_uri_t _get_eq_settings_handler = {

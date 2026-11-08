@@ -661,12 +661,75 @@
     }
 
     // Render the UI based on schema
+    function renderSpeakerTestCard() {
+      const card = document.createElement('div');
+      card.className = 'speaker-test-card';
+      card.style.cssText = 'background: white; padding: 15px 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;';
+
+      const infoDiv = document.createElement('div');
+      infoDiv.innerHTML = '<div style="font-weight: bold; font-size: 16px; color: #333;">🔊 Lautsprecher-Test (Beep)</div><div style="font-size: 13px; color: #666; margin-top: 3px;">Spielt einen 1-sekündigen Testton ab (auch während Musik läuft).</div>';
+      card.appendChild(infoDiv);
+
+      const btnContainer = document.createElement('div');
+      btnContainer.style.cssText = 'display: flex; gap: 10px; flex-wrap: wrap;';
+
+      const isMono = (currentSettings && currentSettings.dac_mode === 1);
+
+      if (isMono) {
+        const btn = document.createElement('button');
+        btn.className = 'btn-beep';
+        btn.innerHTML = '🔊 Testton Lautsprecher';
+        btn.style.cssText = 'background: #28a745; color: white; border: none; border-radius: 6px; padding: 10px 18px; font-weight: bold; font-size: 14px; cursor: pointer; transition: all 0.2s;';
+        btn.onclick = () => triggerTestBeep('both', btn);
+        btnContainer.appendChild(btn);
+      } else {
+        const btnL = document.createElement('button');
+        btnL.className = 'btn-beep';
+        btnL.innerHTML = '🔊 Test Links';
+        btnL.style.cssText = 'background: #007bff; color: white; border: none; border-radius: 6px; padding: 10px 18px; font-weight: bold; font-size: 14px; cursor: pointer; transition: all 0.2s;';
+        btnL.onclick = () => triggerTestBeep('left', btnL);
+        btnContainer.appendChild(btnL);
+
+        const btnR = document.createElement('button');
+        btnR.className = 'btn-beep';
+        btnR.innerHTML = '🔊 Test Rechts';
+        btnR.style.cssText = 'background: #17a2b8; color: white; border: none; border-radius: 6px; padding: 10px 18px; font-weight: bold; font-size: 14px; cursor: pointer; transition: all 0.2s;';
+        btnR.onclick = () => triggerTestBeep('right', btnR);
+        btnContainer.appendChild(btnR);
+      }
+
+      card.appendChild(btnContainer);
+      return card;
+    }
+
+    async function triggerTestBeep(channel, btn) {
+      if (btn) {
+        btn.disabled = true;
+        const origText = btn.innerHTML;
+        btn.innerHTML = '⏳ Beep...';
+        btn.style.opacity = '0.7';
+        setTimeout(() => {
+          btn.disabled = false;
+          btn.innerHTML = origText;
+          btn.style.opacity = '1';
+        }, 1200);
+      }
+      try {
+        await postRequest('/api/dac/beep', { channel: channel, duration_ms: 1000 });
+      } catch (err) {
+        console.error('Error triggering beep:', err);
+      }
+    }
+
     function renderUI() {
       const content = document.getElementById('content');
       content.innerHTML = '';
 
       const container = document.createElement('div');
       container.className = 'parameters-container';
+
+      // Speaker test card at the top
+      container.appendChild(renderSpeakerTestCard());
 
       // Render each group
       if (schema.groups) {

@@ -95,6 +95,15 @@ int32_t reset_latency_buffer(void);
 int32_t server_now(int64_t *sNow, int64_t *diff2Server);
 
 int32_t pcm_chunk_queue_msg_waiting(void);
+
+/**
+ * @brief Trigger a test beep tone (880 Hz sine wave)
+ * @param channel 0=both/mono, 1=left only, 2=right only
+ * @param duration_ms Duration in milliseconds (default: 1000)
+ * @return ESP_OK on success
+ */
+esp_err_t player_trigger_beep(int channel, int duration_ms);
+
 #ifdef __cplusplus
 }
 #endif

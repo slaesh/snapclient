@@ -432,6 +432,16 @@
     <div class="loading">Loading DAC settings...</div>
   </div>
 
+  <div id="speaker-test-section" style="margin-top: 25px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+    <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px;">
+      <div>
+        <h3 style="margin: 0; color: #333;">🔊 Lautsprecher-Test (Beep)</h3>
+        <p style="font-size: 14px; color: #666; margin: 5px 0 0 0;">Spielt einen 1-sekündigen Testton ab (auch während Musik läuft).</p>
+      </div>
+      <div id="speaker-test-buttons" style="display: flex; gap: 10px; flex-wrap: wrap;"></div>
+    </div>
+  </div>
+
   <div style="margin-top: 25px; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
     <h3 style="margin-top:0; color:#333;">Hardware I2C Register Diagnostics</h3>
     <p style="font-size:14px; color:#666; margin-bottom:15px;">Reads and displays live hardware registers (Control, State, Volume, Mixer Matrix, Faults) directly from the amplifier via I2C, and outputs them to the serial monitor.</p>
@@ -605,6 +615,53 @@
 
       // Render parameters
       renderParameters();
+      updateSpeakerTestButtons();
+    }
+
+    function updateSpeakerTestButtons() {
+      const container = document.getElementById('speaker-test-buttons');
+      if (!container) return;
+      container.innerHTML = '';
+
+      const isMono = (currentSettings && currentSettings.dac_mode === 1);
+      if (isMono) {
+        const btn = document.createElement('button');
+        btn.innerHTML = '🔊 Testton Lautsprecher';
+        btn.style.cssText = 'padding: 10px 18px; background: #28a745; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold;';
+        btn.onclick = () => triggerTestBeep('both', btn);
+        container.appendChild(btn);
+      } else {
+        const btnL = document.createElement('button');
+        btnL.innerHTML = '🔊 Test Links';
+        btnL.style.cssText = 'padding: 10px 18px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold;';
+        btnL.onclick = () => triggerTestBeep('left', btnL);
+        container.appendChild(btnL);
+
+        const btnR = document.createElement('button');
+        btnR.innerHTML = '🔊 Test Rechts';
+        btnR.style.cssText = 'padding: 10px 18px; background: #17a2b8; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 14px; font-weight: bold;';
+        btnR.onclick = () => triggerTestBeep('right', btnR);
+        container.appendChild(btnR);
+      }
+    }
+
+    async function triggerTestBeep(channel, btn) {
+      if (btn) {
+        btn.disabled = true;
+        const origText = btn.innerHTML;
+        btn.innerHTML = '⏳ Beep...';
+        btn.style.opacity = '0.7';
+        setTimeout(() => {
+          btn.disabled = false;
+          btn.innerHTML = origText;
+          btn.style.opacity = '1';
+        }, 1200);
+      }
+      try {
+        await postRequest('/api/dac/beep', { channel: channel, duration_ms: 1000 });
+      } catch (err) {
+        console.error('Error triggering beep:', err);
+      }
     }
 
     // Render parameters based on schema

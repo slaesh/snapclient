@@ -2890,6 +2890,13 @@ esp_err_t tas5805m_settings_get_eq_json(char *json_out, size_t max_len) {
     }
     cJSON_AddNumberToObject(root, "eq_mode", (int)eq_mode_val);
 
+    // Get current DAC mode (BTL stereo vs PBTL mono)
+    TAS5805M_DAC_MODE dac_mode_val = TAS5805M_DAC_MODE_BTL;
+    if (tas5805m_get_dac_mode(&dac_mode_val) != ESP_OK) {
+        dac_mode_val = TAS5805M_DAC_MODE_BTL;
+    }
+    cJSON_AddNumberToObject(root, "dac_mode", (int)dac_mode_val);
+
     // Get current EQ UI mode
     TAS5805M_EQ_UI_MODE ui_mode = TAS5805M_EQ_UI_MODE_OFF;
     tas5805m_settings_load_eq_ui_mode(&ui_mode);

@@ -128,6 +128,16 @@ extern void audio_dac_enable(bool enabled);
 static i2s_chan_handle_t tx_chan = NULL;  // I2S tx channel handler
 static bool i2sEnabled = false;
 
+static volatile bool s_beep_active = false;
+static volatile bool s_beep_idle_running = false;
+static volatile bool s_player_is_playing = false;
+static int s_beep_channel = 0; // 0=both/mono, 1=left, 2=right
+static uint32_t s_beep_remaining_samples = 0;
+static uint32_t s_beep_total_samples = 0;
+static float s_beep_phase = 0.0f;
+static float s_beep_phase_step = 0.0f;
+static int s_beep_fade_samples = 0;
+
 i2s_std_gpio_config_t pin_config0;
 i2s_port_t i2sNum;
 
@@ -138,6 +148,7 @@ i2s_port_t i2sNum;
 esp_err_t my_i2s_channel_disable(i2s_chan_handle_t handle) {
   if (tx_chan != NULL) {
     if (i2sEnabled == true) {
+      s_player_is_playing = false;
       /* Safely stop DAC before cutting I2S clocks to prevent pops/screeches */
       audio_dac_enable(false);
       i2sEnabled = false;
@@ -225,7 +236,39 @@ static esp_err_t player_i2s_write(i2s_chan_handle_t tx_handle, const void *src, 
   while (rem_samples > 0) {
     size_t chunk_samples = (rem_samples > 256) ? 256 : rem_samples;
     for (size_t i = 0; i < chunk_samples; i++) {
-      i2s_expand_buf[i] = player_expand_sample(src16[i]);
+      int16_t sample = src16[i];
+      if (s_beep_active) {
+        bool is_mono = (currentSnapcastSetting.ch == 1);
+        bool is_right = is_mono ? false : (i % 2 == 1);
+        bool is_left = is_mono ? true : (i % 2 == 0);
+        bool apply_beep = (s_beep_channel == 0) ||
+                          (s_beep_channel == 1 && is_left) ||
+                          (s_beep_channel == 2 && is_right);
+        if (apply_beep) {
+          uint32_t curr = s_beep_total_samples - s_beep_remaining_samples;
+          float env = 1.0f;
+          if (curr < (uint32_t)s_beep_fade_samples) {
+            env = 0.5f * (1.0f - cosf((float)curr * (float)M_PI / (float)s_beep_fade_samples));
+          } else if (s_beep_remaining_samples < (uint32_t)s_beep_fade_samples) {
+            env = 0.5f * (1.0f - cosf((float)s_beep_remaining_samples * (float)M_PI / (float)s_beep_fade_samples));
+          }
+          int16_t tone = (int16_t)(sinf(s_beep_phase) * 12000.0f * env);
+          int32_t mixed = (int32_t)sample + tone;
+          if (mixed > 32767) mixed = 32767;
+          else if (mixed < -32768) mixed = -32768;
+          sample = (int16_t)mixed;
+        }
+        if (is_mono || is_right) {
+          s_beep_phase += s_beep_phase_step;
+          if (s_beep_phase >= 2.0f * (float)M_PI) s_beep_phase -= 2.0f * (float)M_PI;
+          if (s_beep_remaining_samples > 0) {
+            s_beep_remaining_samples--;
+          } else {
+            s_beep_active = false;
+          }
+        }
+      }
+      i2s_expand_buf[i] = player_expand_sample(sample);
     }
     size_t out_written = 0;
     esp_err_t err = i2s_channel_write(tx_handle, i2s_expand_buf, chunk_samples * sizeof(int32_t), &out_written, timeout_ms);
@@ -240,6 +283,90 @@ static esp_err_t player_i2s_write(i2s_chan_handle_t tx_handle, const void *src, 
   }
   if (bytes_written) *bytes_written = total_in_written;
   return ESP_OK;
+}
+
+static void player_beep_idle_task(void *pv) {
+  int channel = (int)(intptr_t)pv;
+  int sr = (currentSnapcastSetting.sr > 0) ? currentSnapcastSetting.sr : 44100;
+  int duration_ms = 1000;
+  int total_frames = sr * duration_ms / 1000;
+  int fade_frames = sr * 25 / 1000;
+  float phase_step = 2.0f * (float)M_PI * 880.0f / (float)sr;
+  float phase = 0.0f;
+
+  ESP_LOGI(TAG, "Playing idle test beep: channel=%d, sr=%d, frames=%d", channel, sr, total_frames);
+
+  my_i2s_channel_enable(tx_chan);
+  audio_dac_enable(true);
+  vTaskDelay(pdMS_TO_TICKS(15));
+  audio_set_mute(false);
+
+  int16_t frame_buf[256 * 2];
+  int remaining_frames = total_frames;
+  int current_frame = 0;
+
+  while (remaining_frames > 0 && !s_player_is_playing) {
+    int chunk_frames = (remaining_frames > 256) ? 256 : remaining_frames;
+    for (int i = 0; i < chunk_frames; i++) {
+      float env = 1.0f;
+      if (current_frame < fade_frames) {
+        env = 0.5f * (1.0f - cosf((float)current_frame * (float)M_PI / (float)fade_frames));
+      } else if (current_frame > total_frames - fade_frames) {
+        env = 0.5f * (1.0f - cosf((float)(total_frames - current_frame) * (float)M_PI / (float)fade_frames));
+      }
+      int16_t tone = (int16_t)(sinf(phase) * 12000.0f * env);
+      phase += phase_step;
+      if (phase >= 2.0f * (float)M_PI) phase -= 2.0f * (float)M_PI;
+
+      int16_t left = (channel == 0 || channel == 1) ? tone : 0;
+      int16_t right = (channel == 0 || channel == 2) ? tone : 0;
+      frame_buf[i * 2] = left;
+      frame_buf[i * 2 + 1] = right;
+      current_frame++;
+    }
+    remaining_frames -= chunk_frames;
+    size_t written = 0;
+    player_i2s_write(tx_chan, frame_buf, chunk_frames * 2 * sizeof(int16_t), &written, pdMS_TO_TICKS(200));
+  }
+
+  if (!s_player_is_playing) {
+    vTaskDelay(pdMS_TO_TICKS(60));
+    audio_set_mute(true);
+    my_i2s_channel_disable(tx_chan);
+  }
+
+  s_beep_idle_running = false;
+  vTaskDelete(NULL);
+}
+
+esp_err_t player_trigger_beep(int channel, int duration_ms) {
+  if (s_beep_idle_running) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (duration_ms <= 0) {
+    duration_ms = 1000;
+  }
+  int sr = (currentSnapcastSetting.sr > 0) ? currentSnapcastSetting.sr : 44100;
+
+  if (s_player_is_playing && i2sEnabled) {
+    s_beep_channel = channel;
+    s_beep_total_samples = (uint32_t)sr * (uint32_t)duration_ms / 1000;
+    s_beep_remaining_samples = s_beep_total_samples;
+    s_beep_fade_samples = sr * 25 / 1000;
+    s_beep_phase = 0.0f;
+    s_beep_phase_step = 2.0f * (float)M_PI * 880.0f / (float)sr;
+    s_beep_active = true;
+    ESP_LOGI(TAG, "Triggered on-stream beep: channel=%d, dur=%dms", channel, duration_ms);
+    return ESP_OK;
+  } else {
+    s_beep_idle_running = true;
+    BaseType_t ret = xTaskCreate(player_beep_idle_task, "beep_idle", 3072, (void *)(intptr_t)channel, 5, NULL);
+    if (ret != pdPASS) {
+      s_beep_idle_running = false;
+      return ESP_FAIL;
+    }
+    return ESP_OK;
+  }
 }
 #else
 #define player_i2s_preload_data i2s_channel_preload_data
@@ -1569,6 +1696,7 @@ static void player_task(void *pvParameters) {
   queueCreatedWithChkInFrames = scSet.chkInFrames;
 
   initialSync = 0;
+  s_player_is_playing = false;
   
   //audio_hal_ctrl_codec(audio_hal_handle_t audio_hal, audio_hal_codec_mode_t mode, audio_hal_ctrl_t audio_hal_ctrl)
 
@@ -1655,6 +1783,7 @@ static void player_task(void *pvParameters) {
 #endif
 
           initialSync = 0;
+  s_player_is_playing = false;
         }
 
         if ((scSet.buf_ms != __scSet.buf_ms) ||
@@ -1836,6 +1965,7 @@ static void player_task(void *pvParameters) {
           age = (int64_t)timer_val - (-age);
 
           initialSync = 1;
+          s_player_is_playing = true;
 
           // TODO: use a timer to un-mute non blocking
           vTaskDelay(pdMS_TO_TICKS(2));
@@ -2187,6 +2317,7 @@ static void player_task(void *pvParameters) {
             my_i2s_channel_disable(tx_chan);
 
             initialSync = 0;
+  s_player_is_playing = false;
 
             insertedSamplesCounter = 0;
 
@@ -2272,6 +2403,7 @@ static void player_task(void *pvParameters) {
          * so unmuting is instantaneous, perfectly smooth, and completely click-free!
          */
         initialSync = 0;
+  s_player_is_playing = false;
         vTaskDelay(pdMS_TO_TICKS(50));
         continue;
       }
@@ -2292,6 +2424,7 @@ static void player_task(void *pvParameters) {
 
       dir = 0;
       initialSync = 0;
+  s_player_is_playing = false;
 
       audio_set_mute(true);
       audio_dac_enable(false);
