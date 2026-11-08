@@ -698,15 +698,18 @@ static esp_err_t tas5805m_refresh(void) {
 
   /* Step 3: Set Digital Volume (0x4C) and Analog Gain (0x54) */
   tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, tas5805m_hw.raw_vol);
-  /* Configure soft volume ramp rate in DIG_VOL_CTRL2 (0x4E): 0x33 = TI default smooth ramp */
-  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x33);
-  /* Disable hardware auto-mute on silence (0x50): prevents clicks/pops during fade-outs and quiet song passages */
-  tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x00);
-  tas5805m_write_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, 0xFF);
+  /* Configure soft volume ramp rate in DIG_VOL_CTRL2 (0x4E): 0x11 = 0.5 dB / 2 samples ramp (matches Linux tas58xx.c) */
+  tas5805m_write_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, 0x11);
+  /* Configure hardware auto-mute on silence with max delay: 5.33s in 0x51 (0x77)
+   * With LSB dither active in the I2S stream, mid-song quiet passages never trigger auto-mute,
+   * while idle periods and host crashes safely mute the power stage after 5.33 seconds.
+   */
+  tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x07);
+  tas5805m_write_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, 0x77);
   uint8_t am_val = 0xFF;
   tas5805m_read_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, &am_val);
-  ESP_LOGI(TAG, "%s: Hardware Auto-Mute (0x50): written 0x00, verified readback 0x%02X (%s)",
-           __func__, am_val, am_val == 0x00 ? "DISABLED (noiseless silence)" : "ENABLED");
+  ESP_LOGI(TAG, "%s: Hardware Auto-Mute (0x50): written 0x07, verified readback 0x%02X (time=5.33s)",
+           __func__, am_val);
   uint8_t again_idx = tas5805m_hw.again;
   if (again_idx > TAS5805M_MIN_GAIN) again_idx = TAS5805M_MIN_GAIN;
   tas5805m_write_byte(TAS5805M_AGAIN_REGISTER, tas5805m_again[again_idx]);
@@ -843,11 +846,12 @@ esp_err_t tas5805m_ctrl(audio_hal_codec_mode_t mode,
     } else {
       ESP_LOGI(TAG, "%s: Warm resume (DSP already booted) - releasing soft-mute", __func__);
       TAS5805M_SET_BOOK_AND_PAGE(TAS5805M_REG_BOOK_CONTROL_PORT, TAS5805M_REG_PAGE_ZERO);
-      tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x00);
+      tas5805m_write_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, 0x07);
+      tas5805m_write_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, 0x77);
       uint8_t am_val = 0xFF;
       tas5805m_read_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, &am_val);
-      ESP_LOGI(TAG, "%s: Warm resume Auto-Mute (0x50) verified: 0x%02X (%s)",
-               __func__, am_val, am_val == 0x00 ? "DISABLED" : "ENABLED");
+      ESP_LOGI(TAG, "%s: Warm resume Auto-Mute (0x50) verified: 0x%02X (time=5.33s)",
+               __func__, am_val);
     }
 
     /* Enter PLAY + MUTE (0x0B), wait for clock lock, then unmute to PLAY (0x03) */
@@ -1950,12 +1954,18 @@ esp_err_t tas5805m_dump_registers(char *buf, size_t buf_len)
   uint8_t vol = 0, again = 0, ana_ctrl = 0, dac_ctrl = 0;
   uint8_t sap1 = 0, sap2 = 0, sap3 = 0;
   uint8_t f_chan = 0, f_glob1 = 0, f_glob2 = 0, f_warn = 0;
+  uint8_t vol_ctrl2 = 0, vol_ctrl3 = 0, am_ctrl = 0, am_time = 0, am_state = 0;
 
   tas5805m_read_byte(TAS5805M_DIE_ID_REGISTER, &die_id);
   tas5805m_read_byte(0x68, &die_ver);
   tas5805m_read_byte(TAS5805M_DEVICE_CTRL_1_REGISTER, &ctrl1);
   tas5805m_read_byte(TAS5805M_DEVICE_CTRL_2_REGISTER, &ctrl2);
   tas5805m_read_byte(TAS5805M_DIG_VOL_CTRL_REGISTER, &vol);
+  tas5805m_read_byte(TAS5805M_DIG_VOL_CTRL2_REGISTER, &vol_ctrl2);
+  tas5805m_read_byte(TAS5805M_DIG_VOL_CTRL3_REGISTER, &vol_ctrl3);
+  tas5805m_read_byte(TAS5805M_AUTO_MUTE_CTRL_REGISTER, &am_ctrl);
+  tas5805m_read_byte(TAS5805M_AUTO_MUTE_TIME_REGISTER, &am_time);
+  tas5805m_read_byte(TAS5805M_AUTOMUTE_STATE_REGISTER, &am_state);
   tas5805m_read_byte(TAS5805M_AGAIN_REGISTER, &again);
   tas5805m_read_byte(TAS5805M_ANA_CTRL_REGISTER, &ana_ctrl);
   tas5805m_read_byte(0x5E, &dac_ctrl);
@@ -1986,9 +1996,14 @@ esp_err_t tas5805m_dump_registers(char *buf, size_t buf_len)
   DUMP_PRINT("  0x25 SAP_CTRL_2:    0x%02X\n", sap2);
   DUMP_PRINT("  0x26 SAP_CTRL_3:    0x%02X\n", sap3);
   DUMP_PRINT("  0x4C DIG_VOL_CTRL:  0x%02X  (%.1f dB)\n", vol, (vol <= 0x30) ? (0x30 - vol) * 0.5f : -(vol - 0x30) * 0.5f);
+  DUMP_PRINT("  0x4E DIG_VOL_CTRL2: 0x%02X\n", vol_ctrl2);
+  DUMP_PRINT("  0x4F DIG_VOL_CTRL3: 0x%02X\n", vol_ctrl3);
+  DUMP_PRINT("  0x50 AUTO_MUTE_CTRL:0x%02X  [%s]\n", am_ctrl, am_ctrl == 0x00 ? "DISABLED" : "ENABLED");
+  DUMP_PRINT("  0x51 AUTO_MUTE_TIME:0x%02X\n", am_time);
+  DUMP_PRINT("  0x53 ANA_CTRL:      0x%02X\n", ana_ctrl);
   DUMP_PRINT("  0x54 AGAIN:         0x%02X  (Index %d = %.1f dB)\n", again, tas5805m_hw.again, -0.5f * tas5805m_hw.again);
   DUMP_PRINT("  0x5E DAC_CTRL:      0x%02X\n", dac_ctrl);
-  DUMP_PRINT("  0x5F ANA_CTRL:      0x%02X\n", ana_ctrl);
+  DUMP_PRINT("  0x69 AUTOMUTE_STATE:0x%02X  [L-Mute:%d R-Mute:%d]\n", am_state, (am_state>>1)&1, am_state&1);
   DUMP_PRINT("  0x70 CHAN_FAULT:    0x%02X  [L-OC:%d R-OC:%d L-DC:%d R-DC:%d]\n",
              f_chan, (f_chan>>1)&1, f_chan&1, (f_chan>>3)&1, (f_chan>>2)&1);
   DUMP_PRINT("  0x71 GLOBAL_FAULT1: 0x%02X  [CLK_FLT:%d PVDD_UV:%d]\n",
